@@ -131,6 +131,11 @@ class Server:
             klic, spojeni = self._spojeni(casti, timeout)
             try:
                 spojeni.request("POST" if data else "GET", cesta, body=data, headers=hlavicky)
+                if spojeni.sock is not None:
+                    try:
+                        spojeni.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except (OSError, AttributeError):
+                        pass
                 odpoved = spojeni.getresponse()
                 telo = odpoved.read()
                 if odpoved.will_close:
@@ -638,6 +643,7 @@ STREAM_EOR = 0x8F
 
 #: Odesílatel bere dostupné rámce ihned, bez čekání na další rámec.
 STREAM_MAX_FRAMES = 50
+STREAM_RETRY_INITIAL_SECONDS = 0.05
 STREAM_RETRY_SECONDS = 1.0
 
 #: Strop bufferu proudu — rámec má desítky bajtů; víc bez konce rámce je
@@ -914,6 +920,7 @@ class StreamLink:
                 sender.join()
 
     def _send_loop(self, decoder_id, pending) -> None:
+        retry_delay = STREAM_RETRY_INITIAL_SECONDS
         while not self._stop.is_set():
             self._ready.clear()
             try:
@@ -925,8 +932,10 @@ class StreamLink:
                 started = time.monotonic()
                 answer = self.server.push_passings(decoder_id, frames)
                 if not answer.get("ok"):
-                    self._stop.wait(STREAM_RETRY_SECONDS)
+                    self._stop.wait(min(retry_delay, STREAM_RETRY_SECONDS))
+                    retry_delay = min(retry_delay * 2, STREAM_RETRY_SECONDS)
                     continue
+                retry_delay = STREAM_RETRY_INITIAL_SECONDS
                 pending.potvrd()
                 _zaznamenat_prujezdy(int(answer.get("stored") or 0))
                 _zaznamenat_preliv(pending.ceka())
@@ -935,7 +944,8 @@ class StreamLink:
                     log(f"Průjezdy {decoder_id[:8]}: potvrzení serveru {elapsed:.0f} ms")
             except (OSError, ValueError, sqlite3.Error):
                 # Včetně ztraceného ACK: nic se nemaže, duplicity řeší server.
-                self._stop.wait(STREAM_RETRY_SECONDS)
+                self._stop.wait(min(retry_delay, STREAM_RETRY_SECONDS))
+                retry_delay = min(retry_delay * 2, STREAM_RETRY_SECONDS)
 
     def _pump(self, sock, pending, service, service_seconds) -> None:
         buffer = bytearray()
@@ -1022,7 +1032,7 @@ class FrameQueue:
         self._lock = threading.Lock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("CREATE TABLE IF NOT EXISTS frames ("
                         "id INTEGER PRIMARY KEY AUTOINCREMENT, received REAL NOT NULL, "
                         "frame TEXT NOT NULL)")
