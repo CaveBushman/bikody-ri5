@@ -44,7 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.11"
+VERSION = "1.12"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -175,8 +175,24 @@ class Server:
         return answer.get("commands") or []
 
     def poll(self) -> dict:
-        """Dlouhý dotaz: příkazy k vyřízení + konfigurace proudu průjezdů."""
-        return self._request("/bmx/api/agent/commands/", timeout=READ_TIMEOUT)
+        """Dlouhý dotaz: příkazy k vyřízení + konfigurace proudu průjezdů.
+
+        **Veze s sebou stav push cesty.** Zpráva o tom, že proud nedoručuje,
+        musí dojít právě tehdy, když nedoručuje — takže nesmí jet dávkou
+        průjezdů. Dlouhý dotaz jede každou vteřinu bez ohledu na provoz,
+        takže je to jediné místo, kde se cloud stav dozví vždycky.
+
+        Starší server přijímá jen GET; když odmítne metodu, zeptáme se
+        postaru a stav prostě nepošleme (krabička se kvůli hlášení
+        neodpojuje).
+        """
+        stav = {"streams": list(_STAV_PROUDU.values())}
+        try:
+            return self._request("/bmx/api/agent/commands/", stav, timeout=READ_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 405:
+                raise
+            return self._request("/bmx/api/agent/commands/", timeout=READ_TIMEOUT)
 
     def push_passings(self, decoder_id: str, frames: list[str]) -> dict:
         """Pošle rámce průjezdů hned, jak je dekodér vydal (base64)."""
@@ -638,6 +654,10 @@ def run_command(server: Server, command: dict) -> None:
 # bajty na rámce podle SOR/EOR — uvnitř rámce jsou tyhle bajty escapované,
 # takže se s obsahem nespletou.
 
+#: Stav proudů, jak ho krabička hlásí serveru. Plní ho `_sync_streams`
+#: při každém ohlášení — jeden zápis na smyčku, žádné zamykání navíc.
+_STAV_PROUDU: dict = {}
+
 STREAM_SOR = 0x8E
 STREAM_EOR = 0x8F
 
@@ -838,6 +858,21 @@ class StreamLink:
         self.config = dict(config)
         self._stop = threading.Event()
         self._ready = threading.Event()
+        self._posledni_ram = None
+        # **Stav proudu, který se hlásí serveru.** Do 13. 9. 2026 o push cestě
+        # cloud nevěděl vůbec nic: když nedoručovala, nikde to nebylo vidět
+        # a hledalo se to hodinu měřením zvenčí (ostrý závod 13. 9. 2026,
+        # medián 86 s). Krabička je jediná, kdo tyhle věci ví — tak je řekne.
+        self.stav = {
+            "decoder": str(config.get("decoder", "")),
+            "host": str(config.get("host", "")),
+            "spojeno": False,        # drží se spojení na dekodér?
+            "chyba": "",             # poslední důvod, proč ne
+            "fronta": 0,             # rámců čeká na odeslání
+            "ram_pred_s": None,      # jak dávno přišel rámec z dekodéru
+            "ack_ms": None,          # jak dlouho trvalo poslední potvrzení serveru
+            "odeslano": 0,           # rámců potvrzených serverem od startu
+        }
         self._thread = threading.Thread(
             target=self._run,
             name=f"stream-{config.get('host')}",
@@ -853,6 +888,16 @@ class StreamLink:
 
     def is_alive(self) -> bool:
         return self._thread.is_alive()
+
+    def hlaseni(self) -> dict:
+        """Stav proudu pro server — s dopočítaným stářím posledního rámce."""
+        zprava = dict(self.stav)
+        zprava["ram_pred_s"] = (
+            None if self._posledni_ram is None
+            else round(time.monotonic() - self._posledni_ram, 1)
+        )
+        zprava["zije"] = self.is_alive()
+        return zprava
 
     def matches(self, config: dict) -> bool:
         """Stejná smyčka a stejné otevírací rámce — spojení může běžet dál.
@@ -905,12 +950,16 @@ class StreamLink:
                         with socket.create_connection((host, port), timeout=3.0) as sock:
                             sock.settimeout(1.0)
                             _remember(host, port, True, "proud průjezdů")
+                            self.stav["spojeno"] = True
+                            self.stav["chyba"] = ""
                             for encoded in self.config.get("open") or []:
                                 sock.sendall(base64.b64decode(encoded))
                             backoff = RECONNECT_MIN
                             self._pump(sock, pending, service, service_seconds)
                     except (OSError, TimeoutError, ValueError) as exc:
                         _remember(host, port, False, str(exc))
+                        self.stav["spojeno"] = False
+                        self.stav["chyba"] = str(exc)[:120]
                     if self._stop.wait(backoff):
                         break
                     backoff = min(backoff * 2, RECONNECT_MAX)
@@ -925,6 +974,7 @@ class StreamLink:
             self._ready.clear()
             try:
                 frames = pending.dalsi(STREAM_MAX_FRAMES)
+                self.stav["fronta"] = pending.ceka()
                 _zaznamenat_preliv(pending.ceka())
                 if not frames:
                     self._ready.wait(1.0)
@@ -932,6 +982,7 @@ class StreamLink:
                 started = time.monotonic()
                 answer = self.server.push_passings(decoder_id, frames)
                 if not answer.get("ok"):
+                    self.stav["chyba"] = str(answer.get("error") or "server dávku nevzal")[:120]
                     self._stop.wait(min(retry_delay, STREAM_RETRY_SECONDS))
                     retry_delay = min(retry_delay * 2, STREAM_RETRY_SECONDS)
                     continue
@@ -940,6 +991,9 @@ class StreamLink:
                 _zaznamenat_prujezdy(int(answer.get("stored") or 0))
                 _zaznamenat_preliv(pending.ceka())
                 elapsed = (time.monotonic() - started) * 1000
+                self.stav["ack_ms"] = round(elapsed)
+                self.stav["odeslano"] += len(frames)
+                self.stav["fronta"] = pending.ceka()
                 if elapsed > 200:
                     log(f"Průjezdy {decoder_id[:8]}: potvrzení serveru {elapsed:.0f} ms")
             except (OSError, ValueError, sqlite3.Error):
@@ -962,6 +1016,7 @@ class StreamLink:
                     buffer.clear()
                 frames = _split_frames(buffer)
                 if frames:
+                    self._posledni_ram = time.monotonic()
                     _zaznamenat_smycku()
                     lost = pending.pridej([
                         base64.b64encode(raw).decode("ascii") for raw in frames
@@ -1356,6 +1411,16 @@ class Worker:
             link = StreamLink(self.server, config)
             self._streams[decoder_id] = link
             link.start()
+
+        # Stav se přepisuje celý: smyčka, kterou závod už nechce, ze hlášení
+        # zmizí spolu s proudem.
+        _STAV_PROUDU.clear()
+        for decoder_id, link in self._streams.items():
+            # `getattr` schválně: proud smí být i jiný objekt (zkoušky mají
+            # vlastní dvojníka) a hlášení stavu nesmí být důvod k pádu odběru.
+            hlaseni = getattr(link, "hlaseni", None)
+            if callable(hlaseni):
+                _STAV_PROUDU[decoder_id] = hlaseni()
 
     def _run(self) -> None:
         backoff = RECONNECT_MIN
