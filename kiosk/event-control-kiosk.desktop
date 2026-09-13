@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Event Control — displej krabičky
-Comment=Stránka agenta přes celou obrazovku, hned po přihlášení plochy
-Exec=/opt/event-control-agent/start-kiosk.sh
-X-GNOME-Autostart-enabled=true
-NoDisplay=true
