@@ -1021,10 +1021,20 @@ class StreamLink:
 
 
 class FrameQueue:
-    """Trvalá FIFO fronta; mazání pouze po ACK, SQLite WAL + FULL sync.
+    """Trvalá FIFO fronta; mazání pouze po ACK, SQLite WAL + NORMAL sync.
 
     Přerušený zápis se vrátí zpět; přerušené potvrzení může zopakovat dávku,
     nikdy však nepotvrdí rámce přijaté během HTTP požadavku.
+
+    **`synchronous=NORMAL`, ne `FULL`** (13. 9. 2026, kvůli rozpočtu 0,2 s na
+    cestu od smyčky do cloudu): zápis rámce leží na přijímací cestě a `FULL`
+    fsyncuje každý commit, což na SD kartě stojí jednotky až desítky
+    milisekund. Cena: **výpadek napájení** může sebrat poslední commity, které
+    se ještě nedostaly z WAL na disk. Pád procesu ani zabití agenta ne — ty
+    WAL přežije. Okno je malé (agent odesílá do milisekund a maže až po ACK),
+    ale existuje; kdyby se ukázalo, že se u trati vypíná proud, patří sem
+    zpátky `FULL`. Docstring tu do dneška tvrdil `FULL`, i když kód dělal
+    `NORMAL` — slib o trvanlivosti, který se nekryl s kódem.
     """
 
     def __init__(self, path):
