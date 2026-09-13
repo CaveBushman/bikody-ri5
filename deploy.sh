@@ -44,6 +44,11 @@ GATEWAY=""
 DNS="1.1.1.1"
 WITH_KIOSK=1
 WITH_PULL=1
+#: Větev, ze které se krabička nasazuje. Od 13. 9. 2026 má repozitář jedinou
+#: (`verejna` je slitá do master a smazaná) — a právě proto se tu jmenuje
+#: natvrdo: klon, který sleduje smazanou větev, musí deploy srovnat, ne se
+#: o ni pokusit a mlčky nasadit starý strom.
+VETEV_CIL=master
 DRY_RUN=0
 KIOSK_REZIM="zadny"      # systemd | zadny — podle toho, zda se instaluje displej
 KIOSK_CEKA_NA_REBOOT=0    # 1 při přechodu z běžící plochy na samostatný kiosk
@@ -118,12 +123,20 @@ echo "Event Control — nastavení krabičky u trati"
 # nasadí staré věci — a na trati to nikdo nepozná (Davidovo zadání
 # 20. 8. 2026: „do deploy krabičky u trati dodělej git pull").
 #
-# Tři opatrnosti:
+# Čtyři opatrnosti:
 #
 #   * `safe.directory` — repozitář patří `pi`, ale skript běží pod sudo
 #     a git by jinak odmítl „dubious ownership",
+#   * **větev se srovná na `master`** — repozitář měl do 13. 9. 2026 dvě
+#     nepříbuzné větve a výchozí byla `verejna`. Klon, který ji sleduje,
+#     po jejím smazání na `git pull` jen zahlásí „couldn't find remote ref"
+#     a deploy by tiše nasadil starý strom — přesně to, kvůli čemu jela
+#     krabička jedenáct vydání starého agenta a nikdo si toho nevšiml.
+#     Skript proto sáhne po `origin/master`, ať klon sledoval cokoli,
 #   * `--ff-only` — na krabičce se nevětví; kdyby se strom rozešel, je lepší
-#     to říct než vyrobit merge commit v terénu,
+#     to říct **nahlas** než vyrobit merge commit v terénu. Rozejitý strom
+#     ani místní změny skript sám nepřepisuje: to je práce, kterou někdo
+#     udělal, a `reset --hard` za zády je horší než nenasazená verze,
 #   * **restart sebe sama** — bash čte skript po částech, takže přepsat
 #     běžící `deploy.sh` uprostřed běhu je past. Když se něco přitáhlo,
 #     skript se spustí znovu z nové verze (a jen jednou, hlídá to proměnná).
@@ -140,9 +153,26 @@ elif [[ $DRY_RUN -eq 1 ]]; then
 else
     GIT=(git -C "$ROOT" -c safe.directory="$ROOT")
     PRED="$("${GIT[@]}" rev-parse HEAD 2>/dev/null || echo "")"
+    VETEV="$("${GIT[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
     if [[ -n "$("${GIT[@]}" status --porcelain 2>/dev/null)" ]]; then
         varuj "v adresáři jsou místní změny — git pull přeskočen"
-    elif "${GIT[@]}" pull --ff-only --quiet; then
+        varuj "zahoďte je (git -C $ROOT checkout .) nebo spusťte s --no-pull"
+    elif ! "${GIT[@]}" fetch --prune --quiet origin 2>/dev/null; then
+        varuj "na git server se nedá dosáhnout — pokračuji s tím, co je v adresáři"
+        varuj "agent se stejně bere ze serveru aplikace, takže tohle nemusí vadit"
+    elif ! "${GIT[@]}" rev-parse --verify --quiet origin/$VETEV_CIL >/dev/null; then
+        varuj "origin nemá větev $VETEV_CIL — zkontrolujte adresu repozitáře"
+    else
+        # Klon smí sledovat cokoli; nasazuje se vždycky `master`. Přepnutí se
+        # hlásí, ať je v logu vidět, že se změnila větev, ne jen commit.
+        if [[ "$VETEV" != "$VETEV_CIL" ]]; then
+            info "klon je na větvi ${VETEV:-bez větve} — přepínám na $VETEV_CIL"
+            spust "${GIT[@]}" checkout --quiet -B "$VETEV_CIL" "origin/$VETEV_CIL"
+        elif ! "${GIT[@]}" merge --ff-only --quiet "origin/$VETEV_CIL" 2>/dev/null; then
+            varuj "strom se rozešel s origin/$VETEV_CIL — nepřepisuju ho sám"
+            varuj "srovnat: git -C $ROOT reset --hard origin/$VETEV_CIL"
+        fi
         PO="$("${GIT[@]}" rev-parse HEAD 2>/dev/null || echo "")"
         if [[ -n "$PRED" && -n "$PO" && "$PRED" != "$PO" ]]; then
             info "stáhnuto: ${PRED:0:7} → ${PO:0:7}"
@@ -153,8 +183,6 @@ else
         else
             info "už bylo aktuální"
         fi
-    else
-        varuj "git pull se nepovedl (offline nebo rozejitý strom) — pokračuji"
     fi
 fi
 
