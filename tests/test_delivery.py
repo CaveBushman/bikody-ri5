@@ -54,7 +54,7 @@ def test_sender_retries_without_another_passing(agent, tmp_path, monkeypatch, fa
     done = threading.Event()
     calls = []
     class Server:
-        def push_passings(self, _, frames):
+        def push_passings(self, _, frames, casy=None):
             calls.append(frames)
             if len(calls) == 1:
                 if failure == 'lost_ack':
@@ -81,7 +81,7 @@ def test_continuous_frames_are_sent_without_waiting_for_silence(agent, tmp_path)
     acknowledged = threading.Event()
     calls = []
     class Server:
-        def push_passings(self, _, frames):
+        def push_passings(self, _, frames, casy=None):
             calls.extend(frames)
             acknowledged.set()
             return {'ok': True, 'stored': len(frames)}
@@ -108,7 +108,7 @@ def test_continuous_frames_are_sent_without_waiting_for_silence(agent, tmp_path)
 def test_slow_http_does_not_stop_reading_or_watchdog(agent, tmp_path):
     started, release = threading.Event(), threading.Event()
     class Server:
-        def push_passings(self, _, frames):
+        def push_passings(self, _, frames, casy=None):
             started.set()
             assert release.wait(2)
             return {'ok': True, 'stored': len(frames)}
@@ -129,3 +129,33 @@ def test_slow_http_does_not_stop_reading_or_watchdog(agent, tmp_path):
             link.stop(); release.set(); sender.join(2); reader.join(2)
             reader_socket.close(); decoder.close()
         assert queue.dalsi(50) == [base64.b64encode(bytes([agent.STREAM_SOR, 2, agent.STREAM_EOR])).decode('ascii')]
+
+
+def test_davka_veze_cas_prijeti_krabickou(agent, tmp_path):
+    """Bez času z krabičky se latence nedá rozložit na úseky.
+
+    „Od smyčky do cloudu" je rozdíl razítka serveru a času **z dekodéru**,
+    takže v něm leží doba doručení i chyba hodin dekodéru — a nepozná se,
+    čeho je kolik (David 18. 9. 2026: „toto by chtělo optimalizovat, není to
+    200 ms"). Čas přijetí si fronta vedla od začátku kvůli vypršení; teď ho
+    i vydá.
+    """
+    fronta = agent.FrameQueue(tmp_path / "fronta.db")
+    # Čerstvé časy: `dalsi()` maže rámce starší než `PRELIV_MAX_DNI`, takže
+    # pevné razítko z roku 2023 by fronta správně zahodila dřív, než by ho
+    # kdo přečetl.
+    ted = time.time()
+    fronta.pridej(["AAA", "BBB"], received=[ted, ted + 0.333])
+
+    ramce = fronta.dalsi(10)
+    casy = fronta.casy()
+
+    assert ramce == ["AAA", "BBB"]
+    assert casy == [int(ted * 1000), int((ted + 0.333) * 1000)], "milisekundy, ne sekundy"
+    assert len(casy) == len(ramce), "čas musí sedět na rámec"
+
+
+def test_bez_nabidnute_davky_zadne_casy(agent, tmp_path):
+    fronta = agent.FrameQueue(tmp_path / "fronta.db")
+
+    assert fronta.casy() == []

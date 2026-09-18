@@ -167,7 +167,7 @@ class _NeberouciServer:
     def __init__(self):
         self.pokusy = 0
 
-    def push_passings(self, decoder_id, batch):
+    def push_passings(self, decoder_id, batch, casy=None):
         self.pokusy += 1
         raise OSError("server nedostupný")
 
@@ -176,7 +176,7 @@ class _BerouciServer:
     def __init__(self):
         self.davky = []
 
-    def push_passings(self, decoder_id, batch):
+    def push_passings(self, decoder_id, batch, casy=None):
         self.davky.append(list(batch))
         return {"ok": True, "stored": len(batch)}
 

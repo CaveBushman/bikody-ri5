@@ -243,13 +243,23 @@ class Server:
                 raise
             return self._request("/commands/", timeout=READ_TIMEOUT)
 
-    def push_passings(self, decoder_id: str, frames: list[str]) -> dict:
-        """Pošle rámce průjezdů hned, jak je dekodér vydal (base64)."""
-        return self._request(
-            "/passings/",
-            {"decoder": decoder_id, "frames": frames, "receipt": True},
-            timeout=15.0,
-        )
+    def push_passings(self, decoder_id: str, frames: list[str],
+                      casy: list[int] | None = None) -> dict:
+        """Pošle rámce průjezdů hned, jak je dekodér vydal (base64).
+
+        `casy` jsou unixové časy v **milisekundách**, kdy krabička ten rámec
+        převzala od dekodéru — jeden na rámec, ve stejném pořadí. Server si
+        tím rozdělí „od smyčky do cloudu" na úsek dekodér→krabička a
+        krabička→server; bez nich je v jednom čísle smíchaná doba doručení
+        s chybou hodin dekodéru a nedá se optimalizovat.
+
+        Pole je **nepovinné**: starší server ho ignoruje a novější server si
+        se starou krabičkou poradí, jen rozklad neukáže.
+        """
+        telo = {"decoder": decoder_id, "frames": frames, "receipt": True}
+        if casy and len(casy) == len(frames):
+            telo["frame_times"] = casy
+        return self._request("/passings/", telo, timeout=15.0)
 
     def result(self, command_id: str, ok: bool, data: dict | None = None, error: str = "") -> None:
         self._request(
@@ -1029,7 +1039,7 @@ class StreamLink:
                     self._ready.wait(1.0)
                     continue
                 started = time.monotonic()
-                answer = self.server.push_passings(decoder_id, frames)
+                answer = self.server.push_passings(decoder_id, frames, pending.casy())
                 if not answer.get("ok"):
                     self.stav["chyba"] = str(answer.get("error") or "server dávku nevzal")[:120]
                     if answer.get("code") == KOD_ZAHODIT:
@@ -1126,6 +1136,10 @@ class StreamLink:
                     f"zahozeno — do žádného otevřeného závodu už nepatří")
             return
         try:
+            # **Přeliv čas přijetí neposílá schválně.** Tyhle rámce ležely na
+            # disku, protože se nedaly doručit — jsou opožděné z definice
+            # a do statistiky latence nepatří. Kdyby se do ní dostaly, každý
+            # výpadek sítě by se v ní tvářil jako pomalé doručování.
             answer = self.server.push_passings(decoder_id, davka)
         except (urllib.error.URLError, OSError, TimeoutError, ValueError):
             return
@@ -1221,10 +1235,19 @@ class FrameQueue:
                 expired = self.db.execute("DELETE FROM frames WHERE received < ?",
                                           (time.time() - PRELIV_MAX_DNI * 86400,)).rowcount
             _zaznamenat_zahozene(expired)
-            rows = self.db.execute("SELECT id, frame FROM frames ORDER BY id LIMIT ?",
+            rows = self.db.execute("SELECT id, frame, received FROM frames ORDER BY id LIMIT ?",
                                    (limit,)).fetchall()
             self._offered = [row[0] for row in rows]
+            # Čas přijetí si fronta vede od začátku (kvůli vypršení), jen ho
+            # dosud nikdo nečetl. Posílá se s dávkou, aby se na serveru dala
+            # latence rozložit na úseky — bez něj je v ní chyba hodin
+            # dekodéru neoddělitelně smíchaná s dobou doručení.
+            self._offered_casy = [row[2] for row in rows]
             return [row[1] for row in rows]
+
+    def casy(self):
+        """Unixové časy (ms), kdy krabička ty rámce převzala od dekodéru."""
+        return [int(float(t) * 1000) for t in getattr(self, "_offered_casy", [])]
 
     def potvrd(self):
         with self._lock:
