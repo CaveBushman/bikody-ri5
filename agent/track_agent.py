@@ -62,6 +62,16 @@ KOD_ZAHODIT = "unknown_decoder"
 #: rovnou (`426`) místo aby se to projevilo až na trati.
 PROTOKOL = 2
 
+#: Kanonická adresa rozhraní agenta. Bez disciplíny v cestě — obsluhuje
+#: krabičky všech disciplín a `bmx` v ní byla nepřesnost z doby, kdy nic
+#: jiného nebylo.
+CESTA = "/api/agent"
+#: Adresa, na kterou chodily krabičky do 18. 9. 2026. Server ji drží
+#: **navždy**; tady je proto, aby nová krabička fungovala i proti staršímu
+#: cloudu — nasazuje se sice cloud první, ale krabička se nesmí rozbít ani
+#: tehdy, když se cloud vrátí zpátky.
+CESTA_STARA = "/bmx/api/agent"
+
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
 #: rovnou ukáže token a jediné, co zbývá, je opsat ho v aplikaci. Vlastní
@@ -101,6 +111,9 @@ class Server:
         # vlákna, hlavní smyčka se ptá na příkazy — `http.client` nesnese dva
         # požadavky na jednom spojení naráz.
         self._mistni = threading.local()
+        #: Zjistilo se, že tenhle cloud kanonickou adresu nezná? Sdílí to
+        #: všechna vlákna schválně: je to vlastnost serveru, ne spojení.
+        self._stara_cesta = False
 
     def _spojeni(self, casti, timeout: float):
         cache = getattr(self._mistni, "spojeni", None)
@@ -126,6 +139,26 @@ class Server:
             spojeni.close()
 
     def _request(self, path: str, payload: dict | None = None, *, timeout: float) -> dict:
+        """Požadavek na kanonickou adresu, se záchytem na tu starou.
+
+        Cesty se píšou bez předpony (`"/hello/"`); tahle metoda k nim
+        doplní `CESTA`, a když server odpoví `404`, zopakuje to na
+        `CESTA_STARA` a **zapamatuje si to** — starý cloud se z ničeho
+        nestane novým a ptát se ho na kanonickou adresu při každém dotazu
+        by u trati stálo jednu zbytečnou cestu tam a zpět za vteřinu.
+        """
+        if self._stara_cesta:
+            return self._odesli(CESTA_STARA + path, payload, timeout=timeout)
+        try:
+            return self._odesli(CESTA + path, payload, timeout=timeout)
+        except urllib.error.HTTPError as chyba:
+            if chyba.code != 404:
+                raise
+        log(f"Server nezná {CESTA}{path} — jedu po starém {CESTA_STARA}")
+        self._stara_cesta = True
+        return self._odesli(CESTA_STARA + path, payload, timeout=timeout)
+
+    def _odesli(self, path: str, payload: dict | None = None, *, timeout: float) -> dict:
         """Jeden požadavek po **drženém** spojení.
 
         Do verze 1.7 šel každý požadavek přes `urllib.request.urlopen`, tedy
@@ -180,7 +213,7 @@ class Server:
         with _prujezdy_lock:
             zahozeno = int(_prujezdy["zahozeno"])
         return self._request(
-            "/bmx/api/agent/hello/",
+            "/hello/",
             {"hostname": socket.gethostname(), "version": VERSION,
              "protocol": PROTOKOL, "dropped_frames": zahozeno},
             timeout=15.0,
@@ -204,23 +237,23 @@ class Server:
         """
         stav = {"streams": list(_STAV_PROUDU.values())}
         try:
-            return self._request("/bmx/api/agent/commands/", stav, timeout=READ_TIMEOUT)
+            return self._request("/commands/", stav, timeout=READ_TIMEOUT)
         except urllib.error.HTTPError as exc:
             if exc.code != 405:
                 raise
-            return self._request("/bmx/api/agent/commands/", timeout=READ_TIMEOUT)
+            return self._request("/commands/", timeout=READ_TIMEOUT)
 
     def push_passings(self, decoder_id: str, frames: list[str]) -> dict:
         """Pošle rámce průjezdů hned, jak je dekodér vydal (base64)."""
         return self._request(
-            "/bmx/api/agent/passings/",
+            "/passings/",
             {"decoder": decoder_id, "frames": frames, "receipt": True},
             timeout=15.0,
         )
 
     def result(self, command_id: str, ok: bool, data: dict | None = None, error: str = "") -> None:
         self._request(
-            "/bmx/api/agent/result/",
+            "/result/",
             {"id": command_id, "ok": ok, "data": data or {}, "error": error},
             timeout=15.0,
         )

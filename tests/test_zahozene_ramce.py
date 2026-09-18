@@ -65,15 +65,18 @@ def test_hello_hlasi_zahozene_serveru(monkeypatch):
 
     poslano = {}
 
-    def falesny_request(self, cesta, telo=None, **kwargs):
+    # Podvrhuje se **přenos**, ne `_request` nad ním: ten od 18. 9. 2026
+    # řeší, jestli požadavek jde na kanonickou adresu `/api/agent/`, nebo
+    # na tu starou — a to má test zkoušet, ne obcházet.
+    def falesne_odeslani(self, cesta, telo=None, **kwargs):
         poslano["cesta"] = cesta
         poslano["telo"] = telo
         return {}
 
-    monkeypatch.setattr(ta.Server, "_request", falesny_request)
+    monkeypatch.setattr(ta.Server, "_odesli", falesne_odeslani)
     ta.Server("https://cloud", "T" * 24).hello()
 
-    assert poslano["cesta"] == "/bmx/api/agent/hello/"
+    assert poslano["cesta"] == "/api/agent/hello/"
     assert poslano["telo"]["dropped_frames"] == 4
 
 
