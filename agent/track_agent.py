@@ -1548,24 +1548,98 @@ class Worker:
 # --- nastavení na disku ----------------------------------------------------
 
 
+def _config_base(jmeno_unix: str, jmeno_okna: str) -> pathlib.Path:
+    """Složka s nastavením podle zvyklostí systému."""
+    if sys.platform.startswith("win"):
+        return pathlib.Path(os.environ.get("APPDATA", pathlib.Path.home())) / jmeno_okna
+    if sys.platform == "darwin":
+        return pathlib.Path.home() / "Library" / "Application Support" / jmeno_okna
+    return pathlib.Path(
+        os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")
+    ) / jmeno_unix
+
+
 def config_path() -> pathlib.Path:
     """Kde má agent uložený server a token — podle zvyklostí systému."""
-    if sys.platform.startswith("win"):
-        base = pathlib.Path(os.environ.get("APPDATA", pathlib.Path.home())) / "BikodyAgent"
-    elif sys.platform == "darwin":
-        base = pathlib.Path.home() / "Library" / "Application Support" / "BikodyAgent"
-    else:
-        base = pathlib.Path(
-            os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")
-        ) / "bikody-agent"
-    return base / "config.json"
+    return _config_base("bikody-agent", "BikodyAgent") / "config.json"
+
+
+def stara_config_path() -> pathlib.Path:
+    """Kde token ležel před přejmenováním na BIKODY (18. 9. 2026).
+
+    **Token je identita krabičky, ne odvozený údaj.** Když ho agent nenajde,
+    vyrobí si nový a v aplikaci se ohlásí jako nespárovaný — obsluha ho pak
+    musí u trati opsat z displeje. Přejmenovaná složka by to udělala každé
+    krabičce v terénu při první aktualizaci.
+    """
+    return _config_base("event-control-agent", "EventControlAgent") / "config.json"
+
+
+#: Přenos ze staré složky se dělá jednou za běh procesu — `load_config` volá
+#: i obsluha každého HTTP požadavku a prohledávat adresář po sekundě je zbytečné.
+_stara_slozka_prenesena = False
+
+
+def prenes_stara_nastaveni() -> list[str]:
+    """Přenese nastavení a přeliv z předchozí složky. Vrátí, co přenesla.
+
+    Kromě tokenu jde o **přeliv** — rámce, které se nevešly do fronty a čekají
+    na disku, až se server ozve. Leží vedle nastavení právě proto, aby přežily
+    restart krabičky (výpadek sítě a restart chodí v praxi spolu). Přejmenovaná
+    složka by je osiřela stejně tiše jako token.
+
+    Nic se **nepřepisuje ani nemaže**: co už v nové složce je, platí, a stará
+    zůstane ležet, takže návrat na předchozí verzi agenta je pořád možný.
+    """
+    stara = stara_config_path().parent
+    nova = config_path().parent
+    if not stara.is_dir() or stara == nova:
+        return []
+
+    preneseno = []
+    for zdroj in sorted(stara.iterdir()):
+        if zdroj.name != "config.json" and not zdroj.name.startswith("preliv-"):
+            continue
+        if not zdroj.is_file():
+            continue
+        cil = nova / zdroj.name
+        if cil.exists():
+            continue
+        try:
+            nova.mkdir(parents=True, exist_ok=True)
+            cil.write_bytes(zdroj.read_bytes())
+            cil.chmod(0o600)
+        except OSError:
+            continue      # nová složka nemusí být zapisovatelná; číst jde dál
+        preneseno.append(zdroj.name)
+    return preneseno
+
+
+def _precti_config(path: pathlib.Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def load_config() -> dict:
-    try:
-        return json.loads(config_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    """Nastavení z disku; po přejmenování i z původní složky."""
+    global _stara_slozka_prenesena
+
+    data = _precti_config(config_path())
+    if data is not None:
+        return data
+
+    if not _stara_slozka_prenesena:
+        _stara_slozka_prenesena = True
+        if prenes_stara_nastaveni():
+            data = _precti_config(config_path())
+            if data is not None:
+                return data
+
+    # Přenos mohl selhat na právech — číst se dá i ze staré cesty.
+    return _precti_config(stara_config_path()) or {}
 
 
 def configured_server(config: dict) -> str:

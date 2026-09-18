@@ -298,23 +298,62 @@ info "verze agenta: ${AGENT_VERZE:-neznámá}"
 spust install -m 755 "$AGENT_ZDROJ" "$INSTALL_DIR/track_agent.py"
 spust install -m 644 "$ROOT/systemd/$AGENT_SERVICE.service" "/etc/systemd/system/$AGENT_SERVICE.service"
 
+# **Token je identita krabičky.** Agent si ho ukládá vedle sebe podle zvyklostí
+# systému, tedy do `$HOME/.config/bikody-agent/` — a `HOME` je v jednotce
+# nastavený na `$INSTALL_DIR`. Do 18. 9. 2026 se sem zapisoval
+# `$INSTALL_DIR/config.json`, což je **jiný soubor, než agent čte**: adresa
+# aplikace se tím nikdy nepředvyplnila a nevšimlo se toho, protože
+# `DEFAULT_SERVER` v kódu je tatáž.
+CONFIG_DIR="$INSTALL_DIR/.config/bikody-agent"
+CONFIG="$CONFIG_DIR/config.json"
+
+# Kde token ležel dřív. Přejmenování na BIKODY změnilo **obojí** — složku
+# s nastavením i instalační adresář —, takže aktualizovaná krabička si v nové
+# cestě nic nenašla, vyrobila si nový token a v aplikaci se ohlásila jako
+# nespárovaná. Obsluha ho pak musí u trati opsat z displeje; přišlo se na to
+# 18. 9. 2026 na krabičce na trati den před závodem.
+STARE_CESTY=(
+    "/opt/event-control-agent/.config/bikody-agent"        # nový kód, stará jednotka
+    "/opt/event-control-agent/.config/event-control-agent" # před přejmenováním
+    "$INSTALL_DIR/.config/event-control-agent"
+)
+
+if [[ ! -f "$CONFIG" ]]; then
+    for stara in "${STARE_CESTY[@]}"; do
+        [[ -f "$stara/config.json" ]] || continue
+        info "přebírám token z $stara"
+        spust mkdir -p "$CONFIG_DIR"
+        # Přeliv jsou rámce, které se nevešly do fronty a čekají na disku, až
+        # se server ozve — leží vedle nastavení právě proto, aby přežily
+        # restart krabičky. Bez nich by aktualizace tiše zahodila naměřené
+        # průjezdy.
+        for soubor in "$stara/config.json" "$stara"/preliv-*.txt; do
+            [[ -f "$soubor" ]] || continue
+            spust cp -n "$soubor" "$CONFIG_DIR/"
+        done
+        spust chmod 600 "$CONFIG"
+        break
+    done
+fi
+
 # Adresa aplikace se zapíše rovnou, takže krabička po zapnutí ukáže token
 # a nemusí se na ní nic nastavovat. Token se nikdy nepřepisuje — obsluha ho
 # má opsaný v aplikaci a tichá výměna by krabičku odpojila.
 if [[ -n "$SERVER" ]]; then
-    if [[ -f "$INSTALL_DIR/config.json" ]]; then
+    if [[ -f "$CONFIG" ]]; then
         info "adresa aplikace: $SERVER (token zůstává)"
-        spust python3 - "$INSTALL_DIR/config.json" "$SERVER" <<'PY'
+        spust python3 - "$CONFIG" "$SERVER" <<'NASTAV_SERVER'
 import json, sys
 cesta, server = sys.argv[1], sys.argv[2]
 data = json.load(open(cesta))
 data["server"] = server
 json.dump(data, open(cesta, "w"), indent=2)
-PY
+NASTAV_SERVER
     else
         info "adresa aplikace: $SERVER (token si krabička vyrobí sama)"
-        zapis "$INSTALL_DIR/config.json" "$(printf '{\n  "server": "%s",\n  "token": "",\n  "autostart": false\n}\n' "$SERVER")"
-        spust chmod 600 "$INSTALL_DIR/config.json"
+        spust mkdir -p "$CONFIG_DIR"
+        zapis "$CONFIG" "$(printf '{\n  "server": "%s",\n  "token": "",\n  "autostart": false\n}\n' "$SERVER")"
+        spust chmod 600 "$CONFIG"
     fi
 fi
 
