@@ -1053,8 +1053,18 @@ class StreamLink:
                 self.stav["ack_ms"] = round(elapsed)
                 self.stav["odeslano"] += len(frames)
                 self.stav["fronta"] = pending.ceka()
-                if elapsed > 200:
-                    log(f"Průjezdy {decoder_id[:8]}: potvrzení serveru {elapsed:.0f} ms")
+                # **Loguje se každá dávka, ne jen ta pomalá.** Do 1.13 se
+                # psal jen překročený rozpočet, takže z měřicí session byly
+                # v logu vidět **jenom výpadky** — medián ani percentil se
+                # z toho spočítat nedá a „vejdeme se do 200 ms?" zůstalo bez
+                # odpovědi. Řádek na dávku unese i závodní den: dávek jsou
+                # jednotky za vteřinu.
+                #
+                # Pomalá dávka má navíc vykřičník, ať se v `journalctl` pozná
+                # očima bez filtrování.
+                log(f"Průjezdy {decoder_id[:8]}: {len(frames)} rámců, "
+                    f"potvrzení serveru {elapsed:.0f} ms"
+                    f"{' !' if elapsed > 200 else ''}")
             except (OSError, ValueError, sqlite3.Error):
                 # Včetně ztraceného ACK: nic se nemaže, duplicity řeší server.
                 self._stop.wait(min(retry_delay, STREAM_RETRY_SECONDS))
