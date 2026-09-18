@@ -5,8 +5,8 @@
 # tehdy, když se mění samotný způsob spojení. Aktualizace aplikace ho nevyžaduje.
 set -euo pipefail
 
-INSTALL_DIR=/opt/event-control-agent
-SERVICE=event-control-agent
+INSTALL_DIR=/opt/bikody-agent
+SERVICE=bikody-agent
 CONFIG="$INSTALL_DIR/config.json"
 
 if [[ $EUID -ne 0 ]]; then

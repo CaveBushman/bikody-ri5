@@ -5,7 +5,7 @@
 # různě dlouho a chybová stránka prohlížeče vypadá jako rozbitá krabička.
 set -euo pipefail
 
-URL="${EVENT_CONTROL_KIOSK_URL:-http://127.0.0.1:8088/}"
+URL="${BIKODY_KIOSK_URL:-http://127.0.0.1:8088/}"
 
 for _ in $(seq 1 90); do
     if curl -fsS --max-time 1 "$URL" >/dev/null 2>&1; then
@@ -46,7 +46,7 @@ fi
 # Wayland tam nemá GPU a cage nikdy nenaskočí („Found 0 GPUs"); na
 # framebuffer umí kreslit X server s ovladačem fbdev.
 if [[ -e /dev/fb0 ]] && command -v xinit >/dev/null; then
-    exec xinit /opt/event-control-agent/kiosk-x-session.sh "$BROWSER" "${FLAGS[@]}" "$URL" \
+    exec xinit /opt/bikody-agent/kiosk-x-session.sh "$BROWSER" "${FLAGS[@]}" "$URL" \
         -- :0 vt1 -keeptty -nolisten tcp
 fi
 

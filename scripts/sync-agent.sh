@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Aktualizuje kopii agenta v tomhle projektu z hlavního repozitáře.
 #
-# Zdrojem pravdy je Event Control (`tools/track_agent.py`) — tam se agent vyvíjí
+# Zdrojem pravdy je BIKODY Cloud (`tools/track_agent.py`) — tam se agent vyvíjí
 # a tam je i pokrytý testy. Kopie tady je proto, aby se krabička dala postavit
 # bez přístupu k němu; nesmí se ale rozejít.
 set -euo pipefail
 
-SOURCE="${1:-$HOME/Development/Event Control/tools/track_agent.py}"
+SOURCE="${1:-$HOME/Development/12 BIKODY SYSTEMS/BIKODY Cloud/tools/track_agent.py}"
 TARGET="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/agent/track_agent.py"
 
 if [[ ! -f "$SOURCE" ]]; then

@@ -63,13 +63,13 @@ průjezdy jsou v dekodérech i v aplikaci.
 | Kamera červená | Software kamery neběží, nebo má jinou adresu než v *Nastavení aplikace*. |
 | Oranžový pruh **… RÁMCŮ ČEKÁ NA DISKU** | Nic. Aplikace zrovna nebere a krabička si průjezdy odložila; pošle je sama, až se ozve. Číslo pak padá k nule. |
 | Červený pruh **ZAHOZENO …** | Průjezdy se ztratily (dlouhý výpadek, plná karta). Dohledat je v aplikaci v *Časomíře* tlačítkem **Dohledat průjezdy z dekodéru** — dokud si je dekodér pamatuje. |
-| Displej je černý | Agent běží dál, časomíra jede. Displej se sám zvedne do tří vteřin; když ne, `sudo systemctl restart event-control-kiosk@$USER`. |
+| Displej je černý | Agent běží dál, časomíra jede. Displej se sám zvedne do tří vteřin; když ne, `sudo systemctl restart bikody-kiosk@$USER`. |
 | Ventilátor jede naplno „bez důvodu" | Podívat se, kdo sype log: `journalctl --since '-1 min' \| wc -l`. Tisíce řádků za minutu = nějaká služba v havarijní smyčce (typicky Raspberry Pi Connect — `rpi-connect off`). |
 
 Log krabičky (přes SSH):
 
 ```bash
-journalctl -u event-control-agent -f
+journalctl -u bikody-agent -f
 ```
 
 ## Náhradní řešení, když krabička chybí

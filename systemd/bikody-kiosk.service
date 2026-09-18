@@ -8,10 +8,10 @@
 # Agent běží ve své vlastní službě a na tomhle nezávisí: když displej zhasne
 # nebo se prohlížeč rozbije, časomíra jede dál.
 [Unit]
-Description=Event Control — displej krabičky
-Documentation=https://github.com/CaveBushman/event-control-ri5
-After=event-control-agent.service systemd-user-sessions.service
-Wants=event-control-agent.service
+Description=BIKODY Cloud — displej krabičky
+Documentation=https://github.com/CaveBushman/bikody-ri5
+After=bikody-agent.service systemd-user-sessions.service
+Wants=bikody-agent.service
 ConditionPathExists=/dev/tty1
 
 # tty1 může mít jen jeden. Bez tohohle řádku ho drží přihlašovací `getty`:
@@ -34,7 +34,7 @@ StandardOutput=journal
 StandardError=journal
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 Environment=WLR_LIBINPUT_NO_DEVICES=1
-ExecStart=/opt/event-control-agent/start-kiosk.sh
+ExecStart=/opt/bikody-agent/start-kiosk.sh
 # Prohlížeč u trati nikdo nezavírá, ale kdyby spadl, černá obrazovka vypadá
 # jako rozbitá krabička.
 Restart=always

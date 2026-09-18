@@ -29,9 +29,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR=/opt/event-control-agent
-AGENT_SERVICE=event-control-agent
-KIOSK_SERVICE=event-control-kiosk
+INSTALL_DIR=/opt/bikody-agent
+AGENT_SERVICE=bikody-agent
+KIOSK_SERVICE=bikody-kiosk
 TIMEZONE_DEFAULT="Europe/Prague"
 
 # Aplikace běží na jednom místě, takže se adresa nikde nevypisuje. `--server`
@@ -114,7 +114,7 @@ fi
 DESKTOP_USER="${SUDO_USER:-${USER:-pi}}"
 [[ "$DESKTOP_USER" == "root" ]] && DESKTOP_USER="pi"
 
-echo "Event Control — nastavení krabičky u trati"
+echo "BIKODY Cloud — nastavení krabičky u trati"
 [[ $DRY_RUN -eq 1 ]] && echo "(nanečisto — nic se nemění)"
 
 # --- 1. čerstvá kopie repozitáře -------------------------------------------
@@ -336,8 +336,8 @@ if [[ $WITH_KIOSK -eq 1 ]]; then
     if [[ ! -d /dev/dri && -e /dev/fb0 ]]; then
         info "SPI displej bez KMS — kiosk pojede přes X na /dev/fb0"
         spust install -d -m 755 /etc/X11/xorg.conf.d
-        spust install -m 644 "$ROOT/kiosk/99-event-control-fbdev.conf" \
-            /etc/X11/xorg.conf.d/99-event-control-fbdev.conf
+        spust install -m 644 "$ROOT/kiosk/99-bikody-fbdev.conf" \
+            /etc/X11/xorg.conf.d/99-bikody-fbdev.conf
         # X spouští služba, ne přihlášený člověk u konzole — bez tohohle by
         # wrapper start odmítl („Only console users are allowed").
         zapis /etc/X11/Xwrapper.config \
@@ -364,7 +364,7 @@ needs_root_rights=yes
     # přesně pojmenovaný soubor; ostatního nastavení uživatele se nedotýkáme.
     DESKTOP_HOME="$(getent passwd "$DESKTOP_USER" 2>/dev/null | cut -d: -f6 || true)"
     DESKTOP_HOME="${DESKTOP_HOME:-/home/$DESKTOP_USER}"
-    spust rm -f "$DESKTOP_HOME/.config/autostart/event-control-kiosk.desktop"
+    spust rm -f "$DESKTOP_HOME/.config/autostart/bikody-kiosk.desktop"
 
     spust install -m 644 "$ROOT/systemd/$KIOSK_SERVICE.service" \
         "/etc/systemd/system/$KIOSK_SERVICE@.service"
@@ -406,7 +406,7 @@ else
 fi
 
 spust install -d -m 755 /etc/systemd/system.conf.d
-zapis /etc/systemd/system.conf.d/event-control-watchdog.conf \
+zapis /etc/systemd/system.conf.d/bikody-cloud-watchdog.conf \
 "# Krabička u trati běží bez obsluhy: když zamrzne, restartuje se sama.
 [Manager]
 RuntimeWatchdogSec=30
@@ -425,7 +425,7 @@ if command -v rpi-connect >/dev/null; then
 fi
 
 spust install -d -m 755 /etc/systemd/journald.conf.d
-zapis /etc/systemd/journald.conf.d/event-control.conf \
+zapis /etc/systemd/journald.conf.d/bikody-cloud.conf \
 "[Journal]
 SystemMaxUse=50M
 "

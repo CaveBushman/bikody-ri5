@@ -15,8 +15,8 @@ Spuštění:
 Adresa aplikace je předvyplněná (`DEFAULT_SERVER`) a token si program vyrobí
 sám — ukáže ho na své stránce a obsluha ho opíše v aplikaci do Nastavení
 aplikace → Přihlásit krabičku. Vlastní server a hotový token se dají předat
-přepínači `--server` / `--token` nebo prostředím (`EVENT_CONTROL_SERVER`,
-`EVENT_CONTROL_AGENT_TOKEN`).
+přepínači `--server` / `--token` nebo prostředím (`BIKODY_SERVER`,
+`BIKODY_AGENT_TOKEN`).
 
 Program je schválně **jen ze standardní knihovny**: na notebooku u trati se
 nemá co instalovat a nemá co se rozbít. Neví nic o P3 ani o formátu startovky
@@ -44,7 +44,23 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.12"
+VERSION = "1.13"
+
+#: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
+#: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
+#: nedala odlišit od dočasné a dávka se zkoušela dokola: fronta se dva dny
+#: plnila a pak se přiznala jako skutečná ztráta, přestože ty rámce do
+#: žádného závodu nepatřily.
+#:
+#: **Neznámý kód se bere jako dočasný.** Zahodit cizí průjezdy je horší než
+#: poslat je dvakrát — server duplicitu srazí otiskem.
+KOD_ZAHODIT = "unknown_decoder"
+
+#: Tvar rozhovoru se serverem, který tenhle agent umí. **2 = rozumím poli
+#: `code`**, tedy umím odlišit trvale odmítnutou dávku od dočasně odložené.
+#: Server odpovídá rozsahem, který zvládne; když je náš vyšší, řekne to
+#: rovnou (`426`) místo aby se to projevilo až na trati.
+PROTOKOL = 2
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -166,7 +182,7 @@ class Server:
         return self._request(
             "/bmx/api/agent/hello/",
             {"hostname": socket.gethostname(), "version": VERSION,
-             "dropped_frames": zahozeno},
+             "protocol": PROTOKOL, "dropped_frames": zahozeno},
             timeout=15.0,
         )
 
@@ -983,6 +999,16 @@ class StreamLink:
                 answer = self.server.push_passings(decoder_id, frames)
                 if not answer.get("ok"):
                     self.stav["chyba"] = str(answer.get("error") or "server dávku nevzal")[:120]
+                    if answer.get("code") == KOD_ZAHODIT:
+                        # Trvalá chyba: smyčka k tomuhle klubu nepatří.
+                        # Držet dávku znamená jen odložit tutéž odpověď o dva
+                        # dny — a pak ji přiznat jako ztrátu, kterou to není.
+                        pending.potvrd()
+                        _zaznamenat_preliv(pending.ceka())
+                        self.stav["fronta"] = pending.ceka()
+                        log(f"Průjezdy {decoder_id[:8]}: server smyčku nezná, "
+                            f"{len(frames)} rámců zahozeno (nepatří do závodu)")
+                        continue
                     self._stop.wait(min(retry_delay, STREAM_RETRY_SECONDS))
                     retry_delay = min(retry_delay * 2, STREAM_RETRY_SECONDS)
                     continue
@@ -1061,7 +1087,15 @@ class StreamLink:
         except (urllib.error.URLError, OSError, TimeoutError, ValueError):
             return
         if not answer.get("ok"):
-            # „Nechci" — dávka zůstává na disku a zkusí se příště. Posun se
+            if answer.get("code") == KOD_ZAHODIT:
+                # Trvalá chyba — viz `KOD_ZAHODIT`. Posun se hýbe, protože
+                # tahle dávka doručená nikdy nebude.
+                preliv.potvrd()
+                _zaznamenat_preliv(preliv.ceka())
+                log(f"Přeliv: server smyčku {decoder_id[:8]} nezná, "
+                    f"{len(davka)} rámců zahozeno (nepatří do závodu)")
+                return
+            # „Teď ne" — dávka zůstává na disku a zkusí se příště. Posun se
             # neposouvá: potvrdit nedoručené by bylo tiché zahození (1.9).
             return
         preliv.potvrd()
@@ -1474,13 +1508,13 @@ class Worker:
 def config_path() -> pathlib.Path:
     """Kde má agent uložený server a token — podle zvyklostí systému."""
     if sys.platform.startswith("win"):
-        base = pathlib.Path(os.environ.get("APPDATA", pathlib.Path.home())) / "EventControlAgent"
+        base = pathlib.Path(os.environ.get("APPDATA", pathlib.Path.home())) / "BikodyAgent"
     elif sys.platform == "darwin":
-        base = pathlib.Path.home() / "Library" / "Application Support" / "EventControlAgent"
+        base = pathlib.Path.home() / "Library" / "Application Support" / "BikodyAgent"
     else:
         base = pathlib.Path(
             os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")
-        ) / "event-control-agent"
+        ) / "bikody-agent"
     return base / "config.json"
 
 
@@ -1524,13 +1558,13 @@ def autostart_path() -> pathlib.Path:
         return (
             pathlib.Path(os.environ.get("APPDATA", pathlib.Path.home()))
             / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-            / "EventControlAgent.cmd"
+            / "BikodyAgent.cmd"
         )
     if sys.platform == "darwin":
-        return pathlib.Path.home() / "Library" / "LaunchAgents" / "cz.bikody.event-control-agent.plist"
+        return pathlib.Path.home() / "Library" / "LaunchAgents" / "cz.bikody.agent.plist"
     return (
         pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config"))
-        / "autostart" / "event-control-agent.desktop"
+        / "autostart" / "bikody-agent.desktop"
     )
 
 
@@ -1546,19 +1580,19 @@ def _autostart_body(command: list[str]) -> str:
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
             '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
             '<plist version="1.0">\n<dict>\n'
-            "    <key>Label</key>\n    <string>cz.bikody.event-control-agent</string>\n"
+            "    <key>Label</key>\n    <string>cz.bikody.agent</string>\n"
             f"    <key>ProgramArguments</key>\n    <array>\n{args}    </array>\n"
             "    <key>RunAtLoad</key>\n    <true/>\n"
             "    <key>KeepAlive</key>\n    <true/>\n"
             "</dict>\n</plist>\n"
         )
     return (
-        "[Desktop Entry]\nType=Application\nName=Event Control — agent u trati\n"
+        "[Desktop Entry]\nType=Application\nName=BIKODY — agent u trati\n"
         f"Exec={quoted}\nX-GNOME-Autostart-enabled=true\nTerminal=false\n"
     )
 
 
-SERVICE_NAME = "event-control-agent.service"
+SERVICE_NAME = "bikody-agent.service"
 
 
 def service_paths() -> tuple[pathlib.Path, bool]:
@@ -1575,7 +1609,7 @@ def _service_unit(command: list[str]) -> str:
     quoted = " ".join(f'"{part}"' for part in command)
     return (
         "[Unit]\n"
-        "Description=Event Control — agent u trati\n"
+        "Description=BIKODY — agent u trati\n"
         "After=network-online.target\n"
         "Wants=network-online.target\n"
         "\n"
@@ -1593,7 +1627,7 @@ def _service_unit(command: list[str]) -> str:
         if os.geteuid() == 0
         else (
             "[Unit]\n"
-            "Description=Event Control — agent u trati\n"
+            "Description=BIKODY — agent u trati\n"
             "After=network-online.target\n"
             "\n"
             "[Service]\n"
@@ -2372,7 +2406,7 @@ def _token_text(token: str) -> str:
 #:
 #: Proč (2. 9. 2026): stránka je displej krabičky a služba ji pouští na
 #: `0.0.0.0`, aby se na ni dalo koukat z notebooku
-#: (`deploy/systemd/event-control-agent.service`). Ověření ale žádné neměla,
+#: (`deploy/systemd/bikody-agent.service`). Ověření ale žádné neměla,
 #: takže **kdokoli na klubové síti mohl agenta přepojit na svůj server** —
 #: `save_config(server_url, …)` a hned `Worker(server_url, token).start()`.
 #: Token i průjezdy by pak šly jemu. Jištění dvěma klepnutími chrání jen
@@ -2530,7 +2564,7 @@ def _service_hint() -> str:
         return "Běží jako služba (<code>Restart=always</code>) — po pádu i po restartu se vrátí sama."
     return (
         f"Nainstalovaná, ale systemd hlásí <code>{state}</code>. "
-        "Log: <code>journalctl -u event-control-agent.service -f</code>"
+        "Log: <code>journalctl -u bikody-agent.service -f</code>"
     )
 
 
@@ -2741,15 +2775,15 @@ def serve_web(state: dict, *, host: str, port: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Agent u trati pro Event Control")
+    parser = argparse.ArgumentParser(description="Agent u trati pro BIKODY")
     parser.add_argument(
         "--server",
-        default=os.environ.get("EVENT_CONTROL_SERVER", ""),
+        default=os.environ.get("BIKODY_SERVER", ""),
         help=f"Adresa aplikace (výchozí {DEFAULT_SERVER})",
     )
     parser.add_argument(
         "--token",
-        default=os.environ.get("EVENT_CONTROL_AGENT_TOKEN", ""),
+        default=os.environ.get("BIKODY_AGENT_TOKEN", ""),
         help="Token agenta z Nastavení aplikace",
     )
     parser.add_argument(

@@ -4,27 +4,27 @@
 # token je heslo do klubové sítě a nemá co dělat v souboru služby ani
 # v historii příkazů.
 [Unit]
-Description=Event Control — agent u trati
-Documentation=https://github.com/CaveBushman/event-control/blob/master/docs/AGENT.md
+Description=BIKODY Cloud — agent u trati
+Documentation=https://github.com/CaveBushman/bikody-cloud/blob/master/docs/AGENT.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/event-control-agent
+WorkingDirectory=/opt/bikody-agent
 # Stránka na všech adresách: na krabičce ji obsluha otevírá na displeji, ale
 # musí se na ni dostat i z notebooku v téže síti.
-ExecStart=/usr/bin/python3 /opt/event-control-agent/track_agent.py --web-host 0.0.0.0
+ExecStart=/usr/bin/python3 /opt/bikody-agent/track_agent.py --web-host 0.0.0.0
 # Wifi u trati vypadává a dekodéry se přepojují; agent si s tím poradí sám,
 # ale kdyby přesto skončil, systemd ho zvedne.
 Restart=always
 RestartSec=5
 # Nastavení si agent ukládá vedle sebe, aby přežilo restart i aktualizaci.
-Environment=HOME=/opt/event-control-agent
+Environment=HOME=/opt/bikody-agent
 # Krabička dělá jednu věc; víc práv než na svoje data a síť nepotřebuje.
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/event-control-agent
+ReadWritePaths=/opt/bikody-agent
 ProtectHome=true
 PrivateTmp=true
 

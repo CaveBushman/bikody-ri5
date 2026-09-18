@@ -1,9 +1,9 @@
-# Event Control — krabička u trati
+# BIKODY Ri5 — krabička u trati
 
 *Ri5 = **R**aspberry P**i 5**. Není to překlep, neopravovat.*
 
 Raspberry Pi s displejem, které stojí u časomíry a **přeposílá data mezi
-aplikací a železem na trati**. Aplikace Event Control běží na serveru
+aplikací a železem na trati**. Aplikace BIKODY Cloud běží na serveru
 v datovém centru; dekodéry MyLaps a cílová kamera mají privátní adresy
 v klubové síti (`192.168.x.y`), na které server nedosáhne. Krabička se serveru
 sama hlásí a spojení naváže za něj.
@@ -11,7 +11,7 @@ sama hlásí a spojení naváže za něj.
 ```
    klubová síť u trati                        internet            datové centrum
  ┌───────────────────────┐                                     ┌────────────────┐
- │ dekodéry 192.168.9.x  │◄── TCP ──┐                          │  Event Control │
+ │ dekodéry 192.168.9.x  │◄── TCP ──┐                          │  BIKODY Cloud  │
  │ kamera   192.168.1.x  │◄── TCP ──┤                          │     server     │
  └───────────────────────┘          │                          └────────────────┘
                             ┌───────┴────────┐   odchozí HTTPS          ▲
@@ -104,9 +104,9 @@ Krabička proto patří do důvěryhodné místní sítě a fyzicky pod dohled.
 Nic se nespouští ručně a nikdo se nikam nepřihlašuje. Tohle je výchozí režim,
 který `deploy.sh` vynutí i na Pi původně nainstalovaném s desktopem:
 
-1. Systemd nastartuje **agenta** (`event-control-agent`) — hlásí se aplikaci
+1. Systemd nastartuje **agenta** (`bikody-agent`) — hlásí se aplikaci
    a přeposílá data. Běží jako systémová služba, takže na ploše nezávisí.
-2. Systemd nastartuje **displej** (`event-control-kiosk@<uživatel>`) — přes
+2. Systemd nastartuje **displej** (`bikody-kiosk@<uživatel>`) — přes
    `cage` (minimální Wayland kompozitor) pustí prohlížeč na holé obrazovce.
    Proto se nemusí zapínat automatické přihlášení ani instalovat plocha.
 3. Displej počká, až se agent ozve, a teprve pak otevře jeho stránku. Chybová
@@ -117,8 +117,8 @@ který `deploy.sh` vynutí i na Pi původně nainstalovaném s desktopem:
 Obojí se dá zkontrolovat:
 
 ```bash
-systemctl status event-control-agent
-systemctl status event-control-kiosk@$USER
+systemctl status bikody-agent
+systemctl status bikody-kiosk@$USER
 ```
 
 Agent na displeji nezávisí: i s černou obrazovkou jede časomíra dál.
@@ -191,10 +191,10 @@ rozsvěcuje skutečný provoz: rámec z dekodéru levou, přijetí serverem prav
 ## Údržba
 
 ```bash
-sudo systemctl status event-control-agent     # stav
-journalctl -u event-control-agent -f          # log
+sudo systemctl status bikody-agent     # stav
+journalctl -u bikody-agent -f          # log
 sudo bash scripts/update.sh                   # nová verze agenta ze serveru
-sudo systemctl restart event-control-agent    # restart
+sudo systemctl restart bikody-agent    # restart
 ```
 
 Agent drží malou sadu síťových operací — připojit se, poslat bajty, vrátit,
@@ -241,7 +241,7 @@ TCP spojení kamkoliv v ní. Proto:
 
 * celý token je na displeji kvůli provozní čitelnosti; krabička proto nepatří
   do veřejné wifi pro diváky ani na místo bez fyzického dohledu;
-* nastavení je v `/opt/event-control-agent/config.json` s právy `600`;
+* nastavení je v `/opt/bikody-agent/config.json` s právy `600`;
 * nový token se vyrábí jen na výslovné přání — tlačítkem **Nový token** na
   displeji (jištěné dvěma klepnutími) nebo v nastavení krabičky — a musí se
   pak znovu opsat v aplikaci;
@@ -257,7 +257,7 @@ z CDN: u trati se nespoléhá na nic, co se stahuje).
 ## Odkud se bere agent
 
 Zdrojem pravdy je hlavní repozitář aplikace
-([CaveBushman/event-control](https://github.com/CaveBushman/event-control)),
+([CaveBushman/bikody-cloud](https://github.com/CaveBushman/bikody-cloud)),
 soubor `tools/track_agent.py` — tam se agent vyvíjí a tam je pokrytý testy.
 Tady je jeho kopie v `agent/track_agent.py`, aby se krabička dala postavit
 i bez přístupu k němu. `scripts/update.sh` si stáhne aktuální verzi přímo
