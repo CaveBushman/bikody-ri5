@@ -6,3 +6,8 @@ __pycache__/
 # Fotky a videa z ladění — nikdy do repozitáře
 :temp/
 temp/
+
+# Cache pytestu a ruffu (viz poznámka ve zbytku repozitářů — vlastní
+# `.gitignore` si dovnitř zapíšou až při prvním běhu).
+.pytest_cache/
+.ruff_cache/
