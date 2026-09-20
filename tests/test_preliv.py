@@ -154,8 +154,7 @@ class _FalesnySocket:
     def recv(self, _kolik):
         if self._davky:
             return self._davky.pop(0)
-        import socket
-        raise socket.timeout()
+        raise TimeoutError()
 
     def sendall(self, data):
         self.odeslano.append(data)
