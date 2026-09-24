@@ -89,6 +89,6 @@ def test_displej_ma_pruh_a_rekne_co_delat():
     sablona = ta._SCREEN
 
     assert "zahozeno-pruh" in sablona
-    assert "DOHLEDEJTE PRŮJEZDY Z DEKODÉRU" in sablona
+    assert "RE-READ THE PASSINGS FROM THE DECODER" in sablona
     # Ztráta **není puls**: pruh nesmí zmizet po dvou sekundách jako dioda.
     assert "pruh.hidden = zahozeno <= 0" in sablona

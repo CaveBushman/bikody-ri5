@@ -128,7 +128,7 @@ def test_displej_rozlisi_odlozene_od_ztraceneho():
 
 def test_pruh_prelivu_je_na_displeji_a_rika_ze_doleti_sam():
     assert 'id="preliv-pruh"' in ta._SCREEN
-    assert "DOLETÍ SAMY" in ta._SCREEN
+    assert "THEY GO OUT BY THEMSELVES" in ta._SCREEN
     # Oranžová, ne červená: nic se neztratilo. Barvu drží třída `preliv`
     # ve `_STYLE`, který se do stránky vkládá zvlášť.
     assert ".preliv {{" in ta._STYLE

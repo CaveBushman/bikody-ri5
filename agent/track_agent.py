@@ -44,7 +44,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.13"
+#: Verze agenta. Zvedá se **při každé změně souboru, kterou má krabička
+#: u trati dostat** — cloud nabízí aktualizaci podle porovnání verzí
+#: (`bmx_racing/views/track_agent.py`), takže beze zvednutí by nasazené
+#: krabičky zůstaly na starém souboru. 1.14: displej mluví anglicky
+#: (rozhodnutí 21. 9. 2026). 1.15: opravy z auditu 23. 9. 2026 — escapování
+#: stránek, token celý jen pro tento počítač, hlídání pracovních vláken,
+#: atomický zápis nastavení, žádné příkazy na loopback, strop těla požadavku.
+VERSION = "1.15"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -203,7 +210,7 @@ class Server:
             except OSError:
                 self._zahod(klic)
                 raise
-        raise OSError("spojení na server se nepodařilo obnovit")  # pragma: no cover
+        raise OSError("the connection to the server could not be restored")  # pragma: no cover
 
     def hello(self) -> dict:
         # `dropped_frames` říká serveru, o kolik rámců krabička přišla —
@@ -288,31 +295,43 @@ class Server:
 
 _pool: dict[tuple[str, int], socket.socket] = {}
 
+#: Výslovná výjimka pro simulátor dekodéru na notebooku (viz
+#: `_validated_target`). Na krabičce se nenastavuje nikdy.
+POVOLIT_LOOPBACK = os.environ.get("BIKODY_AGENT_ALLOW_LOOPBACK") == "1"
+
 
 def _validated_target(host: str, port: int) -> tuple[str, int]:
     """Povolí jen IP adresu v neveřejné síti a platný TCP port.
 
     Token odemyká příkazy ze serveru do klubové sítě. Veřejné adresy,
     multicast a link-local metadata proto nejsou legitimní cíl decoderu ani
-    kamery. Loopback zůstává kvůli lokální diagnostice a testovacímu decoderu.
+    kamery.
+
+    **Loopback taky ne** (audit 23. 9. 2026): na 127.0.0.1 poslouchá stránka
+    krabičky a její zápisové cesty věří právě loopbacku — příkaz ze serveru
+    by přes `tcp_send` přepsal nastavení (adresu serveru, token) zevnitř.
+    Dekodér ani kamera na krabičce neběží. Simulátor dekodéru na notebooku
+    se pustí jen s výslovným `BIKODY_AGENT_ALLOW_LOOPBACK=1`.
     """
     try:
         address = ipaddress.ip_address((host or "").strip())
     except ValueError as exc:
-        raise ValueError("Cíl musí být číselná IP adresa v místní síti.") from exc
+        raise ValueError("The target must be a numeric IP address on the local network.") from exc
     if address.version != 4 or address.is_multicast or address.is_unspecified:
-        raise ValueError("Cílová IP adresa není povolená.")
+        raise ValueError("That target IP address is not allowed.")
     if address.is_link_local:
-        raise ValueError("Link-local adresa není pro decoder ani kameru povolená.")
+        raise ValueError("A link-local address is allowed for neither the decoder nor the camera.")
     private_ranges = (
         ipaddress.ip_network("10.0.0.0/8"),
         ipaddress.ip_network("172.16.0.0/12"),
         ipaddress.ip_network("192.168.0.0/16"),
     )
+    if address.is_loopback and not POVOLIT_LOOPBACK:
+        raise ValueError("The box does not connect to itself (loopback).")
     if not (address.is_loopback or any(address in network for network in private_ranges)):
-        raise ValueError("Krabička se smí připojit jen do místní privátní sítě.")
+        raise ValueError("The box may connect only to the local private network.")
     if not 1 <= int(port) <= 65535:
-        raise ValueError("Port musí být v rozsahu 1–65535.")
+        raise ValueError("The port must be in the range 1–65535.")
     return str(address), int(port)
 
 #: Posledních pár spojení na železo. Na displeji krabičky u trati je to jediné,
@@ -438,7 +457,7 @@ def tcp_exchange(args: dict) -> dict:
                     _drop((host, port))
                     if chunks:
                         break
-                    raise ConnectionError("Spojení zavřel protějšek.")
+                    raise ConnectionError("The peer closed the connection.")
                 chunks.append(chunk)
             return {"data": base64.b64encode(b"".join(chunks)).decode("ascii")}
         except (OSError, TimeoutError):
@@ -579,7 +598,7 @@ def udp_discover(args: dict) -> dict:
                 continue
             sent.append(target)
         if not sent:
-            return {"replies": [], "error": "Broadcast neprošel žádným rozhraním."}
+            return {"replies": [], "error": "The broadcast got through on no interface."}
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -683,6 +702,8 @@ def run_command(server: Server, command: dict) -> None:
         server.result(command.get("id"), False, error=f"Neznámý příkaz {command.get('action')!r}.")
         return
     args = command.get("args") or {}
+    if not isinstance(args, dict):
+        args = {}      # vadný tvar: akce pak selže `KeyError`em níž a ohlásí se
     host = str(args.get("host", ""))
     try:
         port = int(args.get("port") or 0)
@@ -695,6 +716,16 @@ def run_command(server: Server, command: dict) -> None:
         # obsluze u rampy stejně, jako by se připojoval sám.
         _remember(host, port, False, str(exc))
         server.result(command.get("id"), False, error=str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001
+        # **Vadný příkaz nesmí zabít vlákno agenta** (audit 23. 9. 2026).
+        # Příkaz bez `host`/`port` hodil `KeyError`, ten prošel až nahoru
+        # a vlákno `agent` umřelo — proces s webem žil dál, systemd neměl co
+        # restartovat a displej svítil OK nad krabičkou, která nic nedělá.
+        detail = f"invalid command ({type(exc).__name__}: {exc})"
+        log(f"Příkaz {command.get('action')!r} selhal: {detail}")
+        _remember(host, port, False, detail)
+        server.result(command.get("id"), False, error=detail)
         return
     _remember(host, port, True)
     server.result(command.get("id"), True, data=data)
@@ -937,6 +968,8 @@ class StreamLink:
             name=f"stream-{config.get('host')}",
             daemon=True,
         )
+        #: Odesílatel dávek; `None`, dokud ho `_run` nespustí.
+        self._sender: threading.Thread | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -946,7 +979,17 @@ class StreamLink:
         self._ready.set()
 
     def is_alive(self) -> bool:
-        return self._thread.is_alive()
+        """Žije čtení **i odesílání**?
+
+        Do 1.14 se hlídalo jen čtecí vlákno. Mrtvý odesílatel pak nechal
+        rámce hromadit ve frontě, hlášení říkalo `zije: true` a nikdo proud
+        nepřeotevřel (audit 23. 9. 2026). Teď `_sync_streams` takový proud
+        zastaví a při dalším dotazu založí znovu.
+        """
+        if not self._thread.is_alive():
+            return False
+        sender = self._sender
+        return sender is None or sender.is_alive()
 
     def hlaseni(self) -> dict:
         """Stav proudu pro server — s dopočítaným stářím posledního rámce."""
@@ -1002,13 +1045,14 @@ class StreamLink:
                 _zaznamenat_zahozene(expired)
             sender = threading.Thread(target=self._send_loop,
                                       args=(decoder_id, pending), daemon=True)
+            self._sender = sender
             sender.start()
             try:
                 while not self._stop.is_set():
                     try:
                         with socket.create_connection((host, port), timeout=3.0) as sock:
                             sock.settimeout(1.0)
-                            _remember(host, port, True, "proud průjezdů")
+                            _remember(host, port, True, "passing stream")
                             self.stav["spojeno"] = True
                             self.stav["chyba"] = ""
                             for encoded in self.config.get("open") or []:
@@ -1040,8 +1084,10 @@ class StreamLink:
                     continue
                 started = time.monotonic()
                 answer = self.server.push_passings(decoder_id, frames, pending.casy())
+                if not isinstance(answer, dict):
+                    raise ValueError("the server answer is not an object")
                 if not answer.get("ok"):
-                    self.stav["chyba"] = str(answer.get("error") or "server dávku nevzal")[:120]
+                    self.stav["chyba"] = str(answer.get("error") or "the server did not take the batch")[:120]
                     if answer.get("code") == KOD_ZAHODIT:
                         # Trvalá chyba: smyčka k tomuhle klubu nepatří.
                         # Držet dávku znamená jen odložit tutéž odpověď o dva
@@ -1079,6 +1125,15 @@ class StreamLink:
                 # Včetně ztraceného ACK: nic se nemaže, duplicity řeší server.
                 self._stop.wait(min(retry_delay, STREAM_RETRY_SECONDS))
                 retry_delay = min(retry_delay * 2, STREAM_RETRY_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                # Odpověď jiného tvaru než slovník (`AttributeError`) zabila
+                # do 1.14 odesílatele a rámce se tiše hromadily ve frontě
+                # (audit 23. 9. 2026). Nic se nemaže — dávka se zopakuje.
+                self.stav["chyba"] = f"sender: {type(exc).__name__}: {exc}"[:120]
+                log(f"Průjezdy {decoder_id[:8]}: nečekaná chyba odesílatele "
+                    f"{type(exc).__name__}: {exc}")
+                self._stop.wait(STREAM_RETRY_SECONDS)
+                retry_delay = STREAM_RETRY_SECONDS
 
     def _pump(self, sock, pending, service, service_seconds) -> None:
         buffer = bytearray()
@@ -1088,10 +1143,10 @@ class StreamLink:
             try:
                 chunk = sock.recv(8192)
                 if not chunk:
-                    raise ConnectionError("Dekodér spojení zavřel.")
+                    raise ConnectionError("The decoder closed the connection.")
                 buffer.extend(chunk)
                 if len(buffer) > STREAM_BUFFER_MAX:
-                    log("Rozsypaný proud — buffer se zahazuje")
+                    log("Stream out of sync — dropping the buffer")
                     buffer.clear()
                 frames = _split_frames(buffer)
                 if frames:
@@ -1444,7 +1499,7 @@ class Worker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.connected = False
-        self.status = "nespuštěno"
+        self.status = "not started"
         self.latest_version = VERSION
         self.latest_sha256 = ""
         #: id smyčky -> běžící proud průjezdů (StreamLink)
@@ -1465,10 +1520,20 @@ class Worker:
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2)
-        self._set("zastaveno", connected=False)
+        self._set("stopped", connected=False)
 
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
+
+    def umrel(self) -> bool:
+        """Vlákno agenta skončilo, aniž by ho někdo zastavil?
+
+        Tohle hlídá `main` (audit 23. 9. 2026): proces s webem by jinak žil
+        dál a systemd by neměl co restartovat.
+        """
+        thread = self._thread
+        return bool(thread is not None and not thread.is_alive()
+                    and not self._stop.is_set())
 
     # -- vnitřek -----------------------------------------------------------
 
@@ -1525,7 +1590,7 @@ class Worker:
     def _run(self) -> None:
         backoff = RECONNECT_MIN
         greeted = False
-        self._set(f"připojuji se na {self.server.base}", connected=False)
+        self._set(f"connecting to {self.server.base}", connected=False)
 
         while not self._stop.is_set():
             try:
@@ -1536,15 +1601,27 @@ class Worker:
                     self.latest_sha256 = str(hello.get("agent_sha256") or "")
                     name = hello.get("agent")
                     organization = hello.get("organization")
-                    self._set(f"připojen jako {name} ({organization})", connected=True)
+                    self._set(f"connected as {name} ({organization})", connected=True)
 
                 answer = self.server.poll()
+                # Tvar odpovědi se ověřuje tady, ne až `AttributeError`em
+                # uvnitř smyčky (audit 23. 9. 2026): cokoli jiného než slovník
+                # je vadná odpověď serveru, tedy dočasná chyba s backoffem.
+                if not isinstance(answer, dict):
+                    raise ValueError("the server answer is not an object")
                 _zaznamenat_pocitadlo(answer.get("passings"))
-                self._sync_streams(answer.get("stream") or [])
-                for command in answer.get("commands") or []:
+                streams = answer.get("stream") or []
+                self._sync_streams([item for item in streams if isinstance(item, dict)]
+                                   if isinstance(streams, list) else [])
+                commands = answer.get("commands") or []
+                for command in commands if isinstance(commands, list) else []:
                     if self._stop.is_set():
                         break
-                    host = (command.get("args") or {}).get("host", "")
+                    if not isinstance(command, dict):
+                        log(f"Příkaz v nečitelném tvaru přeskočen: {command!r:.80}")
+                        continue
+                    args = command.get("args")
+                    host = args.get("host", "") if isinstance(args, dict) else ""
                     log(f"Příkaz {command.get('action')} → {host}")
                     run_command(self.server, command)
                 backoff = RECONNECT_MIN
@@ -1554,16 +1631,25 @@ class Worker:
                     # krabička po zapnutí, než ho někdo opíše do Nastavení
                     # dekodérů. Není to chyba, je to čekání.
                     greeted = False
-                    self._set("čeká na schválení v aplikaci", connected=False)
+                    self._set("waiting for approval in the app", connected=False)
                     self._stop.wait(APPROVAL_POLL_SECONDS)
                     continue
                 greeted = False
-                self._set(f"server odpověděl {exc.code}, zkusím to znovu", connected=False)
+                self._set(f"server answered {exc.code}, retrying", connected=False)
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, RECONNECT_MAX)
             except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
                 greeted = False
-                self._set(f"server není k dispozici ({exc})", connected=False)
+                self._set(f"server unavailable ({exc})", connected=False)
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, RECONNECT_MAX)
+            except Exception as exc:  # noqa: BLE001
+                # Poslední záchranná síť (audit 23. 9. 2026): cokoli
+                # nečekaného se zaloguje a zkusí se znovu. Mrtvé vlákno
+                # `agent` by krabičku odstřihlo od serveru bez jediné stopy.
+                greeted = False
+                log(f"Nečekaná chyba agenta: {type(exc).__name__}: {exc}")
+                self._set(f"internal error ({type(exc).__name__}), retrying", connected=False)
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, RECONNECT_MAX)
 
@@ -1676,17 +1762,49 @@ def configured_server(config: dict) -> str:
 
 
 def save_config(server_url: str, token: str, *, autostart: bool = False) -> None:
-    """Uloží nastavení tak, aby ho nečetl kdokoli — token je heslo do sítě."""
+    """Uloží nastavení tak, aby ho nečetl kdokoli — token je heslo do sítě.
+
+    **Atomicky** (audit 23. 9. 2026): dočasný soubor s právy 0600, `fsync`
+    a `os.replace`. Přímý `write_text` po výpadku proudu uprostřed zápisu
+    nechal prázdný nebo useknutý `config.json`; agent ho pak nepřečetl,
+    vyrobil **nový token** a krabička se v aplikaci ohlásila jako
+    nespárovaná. Právo 0600 má soubor od prvního bajtu, ne až po `chmod`.
+    """
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"server": server_url, "token": token, "autostart": autostart}, indent=2),
-        encoding="utf-8",
-    )
+    data = json.dumps(
+        {"server": server_url, "token": token, "autostart": autostart}, indent=2,
+    ).encode("utf-8")
+    docasny = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    fd = os.open(docasny, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass          # Windows práva takhle neumí a nevadí to
+        with os.fdopen(fd, "wb") as soubor:
+            soubor.write(data)
+            soubor.flush()
+            os.fsync(soubor.fileno())
+        try:
+            os.chmod(docasny, 0o600)   # umask ani starý soubor práva nerozšíří
+        except OSError:
+            pass      # Windows práva takhle neumí a nevadí to
+        os.replace(docasny, path)
+    except BaseException:
+        try:
+            os.unlink(docasny)
+        except OSError:
+            pass
+        raise
+    if hasattr(os, "O_DIRECTORY"):
+        # Přejmenování je trvalé až se zapsanou složkou.
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
 
 
 # --- spouštění po startu počítače -----------------------------------------
@@ -1796,9 +1914,9 @@ def install_service() -> int:
     """
     if not sys.platform.startswith("linux"):
         print(
-            'Služba se instaluje jen na Linuxu (krabička u trati). '
-            'Na macOS drží agenta LaunchAgent s KeepAlive, na Windows '
-            'použijte volbu „Spouštět po startu počítače“ v nastavení.'
+            'The service installs only on Linux (the trackside box). '
+            'On macOS a LaunchAgent with KeepAlive holds the agent; on Windows '
+            'use the "Start when the computer boots" option in the settings.'
         )
         return 1
 
@@ -1817,17 +1935,17 @@ def install_service() -> int:
     for step in steps:
         result = subprocess.run(step, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"Nepovedlo se: {' '.join(step)}\n{result.stderr.strip()}")
+            print(f"Failed: {' '.join(step)}\n{result.stderr.strip()}")
             return result.returncode
         print(f"OK: {' '.join(step)}")
 
-    print(f"\nSlužba je v {path}")
+    print(f"\nThe service is in {path}")
     if system:
-        print("Agent se spustí po startu i po pádu. Log: journalctl -u " + SERVICE_NAME + " -f")
+        print("The agent starts on boot and after a crash. Log: journalctl -u " + SERVICE_NAME + " -f")
     else:
         user = os.environ.get("USER") or "pi"
         print(
-            "Agent se spustí po přihlášení a po pádu. Aby běžel i bez přihlášení:\n"
+            "The agent starts on login and after a crash. To run it without a login:\n"
             f"    sudo loginctl enable-linger {user}\n"
             f"Log: journalctl --user -u {SERVICE_NAME} -f"
         )
@@ -1837,7 +1955,7 @@ def install_service() -> int:
 def uninstall_service() -> int:
     """Vypne a smaže službu — pro notebook, kde má agenta spouštět obsluha."""
     if not sys.platform.startswith("linux"):
-        print("Služba existuje jen na Linuxu.")
+        print("The service exists only on Linux.")
         return 1
     path, system = service_paths()
     scope = [] if system else ["--user"]
@@ -1935,6 +2053,19 @@ def normalize_token(raw: str) -> str:
     return "".join(char for char in (raw or "").upper() if char.isalnum())
 
 
+def maskuj_token(token: str) -> str:
+    """Token bez tajemství: první skupina a tečky (`AKUW-••••`).
+
+    Stačí k tomu, aby obsluha poznala, *která* krabička to je, a nestačí
+    k tomu, aby se za ni kdokoli jiný vydával.
+    """
+    token = (token or "").strip()
+    if not token or token == "—":
+        return token or "—"
+    prvni = token.split("-", 1)[0][:TOKEN_GROUP_LEN]
+    return f"{prvni}-••••"
+
+
 def ensure_token(config: dict) -> str:
     """Token krabičky — jednou vyrobený zůstává, dokud ho někdo nezmění."""
     token = (config.get("token") or "").strip()
@@ -1942,7 +2073,9 @@ def ensure_token(config: dict) -> str:
         return token
     token = generate_token()
     save_config(config.get("server", ""), token, autostart=bool(config.get("autostart")))
-    log(f"Vyroben token krabičky: {token}")
+    # Do logu jen maskovaný: `journalctl` čte víc lidí a strojů než displej
+    # (audit 23. 9. 2026). Celý je na displeji krabičky.
+    log(f"Vyroben token krabičky: {maskuj_token(token)}")
     return token
 
 
@@ -2135,7 +2268,7 @@ _STYLE = """
 #: animace nikdy nedoběhla a obrazovka by problikávala. Stav se proto tahá
 #: z `/stav` (JSON) a mění se jen to, co se změnilo.
 _SCREEN = """<!doctype html>
-<html lang="cs"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{nadpis}</title>
 <style>{styl}</style>
@@ -2167,9 +2300,9 @@ _SCREEN = """<!doctype html>
   <div class="uzel">
    <span class="{dioda_smycka}" id="dioda-smycka"></span>
    <div>
-    <div class="nazev">Smyčka</div>
+    <div class="nazev">Loop</div>
     <div class="{trida_smycka}" id="text-smycka">{text_smycka}</div>
-    <div class="pod">PŘÍJEM ZE SMYČKY</div>
+    <div class="pod">INPUT FROM THE LOOP</div>
    </div>
   </div>
   <div class="sipka">&rarr;</div>
@@ -2178,7 +2311,7 @@ _SCREEN = """<!doctype html>
    <div>
     <div class="nazev">Server</div>
     <div class="{trida_server}" id="text-server">{text_server}</div>
-    <div class="pod">DATA PŘEDÁNA SERVERU</div>
+    <div class="pod">DATA HANDED TO THE SERVER</div>
    </div>
   </div>
  </section>
@@ -2196,22 +2329,22 @@ _SCREEN = """<!doctype html>
       u trati je ten, kdo dohledání spouští, a bez věty „co teď" je hlášení
       jen zlá zpráva. -->
  <div id="zahozeno-pruh" class="zahozeno" hidden>
-  &#9888;&nbsp;ZAHOZENO <strong id="zahozeno-pocet">0</strong> RÁMCŮ
-  (<span id="zahozeno-kdy"></span>) — V APLIKACI DOHLEDEJTE PRŮJEZDY Z DEKODÉRU
+  &#9888;&nbsp;DROPPED <strong id="zahozeno-pocet">0</strong> FRAMES
+  (<span id="zahozeno-kdy"></span>) — IN THE APP, RE-READ THE PASSINGS FROM THE DECODER
  </div>
 
  <!-- Přeliv: rámce leží na disku a čekají, až server začne brát. Obsluha
       nemá nikam běžet — tohle je informace „nic se neztratilo", ne úkol.
       Proto oranžově a s větou o tom, že to doletí samo. -->
  <div id="preliv-pruh" class="preliv" hidden>
-  &#8987;&nbsp;<strong id="preliv-pocet">0</strong> RÁMCŮ ČEKÁ NA DISKU —
-  DOLETÍ SAMY, JAK SE SERVER OZVE
+  &#8987;&nbsp;<strong id="preliv-pocet">0</strong> FRAMES WAITING ON DISK —
+  THEY GO OUT BY THEMSELVES ONCE THE SERVER ANSWERS
  </div>
 
  <footer class="paticka">
-  <span class="vlevo">&#8635;&nbsp;POSLEDNÍ PRŮJEZD: <strong id="posledni">{posledni}</strong></span>
+  <span class="vlevo">&#8635;&nbsp;LAST PASSING: <strong id="posledni">{posledni}</strong></span>
   <span>AGENT <strong id="verze">{verze}</strong></span>
-  <a href="/nastaveni">NASTAVENÍ</a>
+  <a href="/nastaveni">SETTINGS</a>
  </footer>
 
 </section></main>
@@ -2256,11 +2389,11 @@ _SCREEN = """<!doctype html>
   function nakresli(data) {{
     dioda("dioda-smycka", "zelena", data.smycka);
     dioda("dioda-server", "modra", data.server);
-    napis("text-smycka", data.smycka ? "SIGNÁL PŘIJAT" : "ČEKÁM NA PRŮJEZD",
+    napis("text-smycka", data.smycka ? "SIGNAL RECEIVED" : "WAITING FOR A PASSING",
           data.smycka ? "zeleno" : "");
-    if (data.server) napis("text-server", "ODESLÁNO", "modro");
-    else if (data.smycka) napis("text-server", "ODESÍLÁM…", "oranzovo");
-    else napis("text-server", "PŘIPRAVEN", "");
+    if (data.server) napis("text-server", "SENT", "modro");
+    else if (data.smycka) napis("text-server", "SENDING…", "oranzovo");
+    else napis("text-server", "READY", "");
 
     document.getElementById("posledni").textContent = data.posledni || "--:--:--";
     // Ztráta **není puls**: pruh zůstane svítit, dokud agent běží. Zmizet
@@ -2302,8 +2435,8 @@ _SCREEN = """<!doctype html>
       var nadpis = tlacitko.querySelector(".nadpis");
       if (nadpis) {{
         nadpis.textContent = data.odjisteno
-          ? "KLEPNĚTE ZNOVU — STARÝ TOKEN PŘESTANE PLATIT"
-          : "NOVÝ TOKEN";
+          ? "TAP AGAIN — THE OLD TOKEN STOPS WORKING"
+          : "NEW TOKEN";
       }}
     }}
   }}
@@ -2324,9 +2457,9 @@ _SCREEN = """<!doctype html>
 </body></html>"""
 
 _SETTINGS = """<!doctype html>
-<html lang="cs"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Nastavení — agent u trati</title>
+<title>Settings — trackside agent</title>
 <style>
  :root {{ color-scheme: dark; font-family: system-ui, sans-serif; }}
  body {{ margin:0; background:#0b0f14; color:#e6edf3; display:flex; justify-content:center; }}
@@ -2352,58 +2485,58 @@ _SETTINGS = """<!doctype html>
  .panel strong {{ color:#fff; }} .ok {{ color:#3fb950; }} .chyba {{ color:#f85149; }}
 </style></head>
 <body><main>
- <h1>Agent u trati — nastavení</h1>
+ <h1>Trackside agent — settings</h1>
  <p class="hint">{stav}</p>
  <form method="post">
-  <label for="server">Adresa aplikace</label>
+  <label for="server">Application address</label>
   <input type="text" id="server" name="server" value="{server}">
-  <p class="hint" style="margin:-8px 0 14px">Předvyplněno; měňte jen u vlastního serveru.</p>
+  <p class="hint" style="margin:-8px 0 14px">Pre-filled; change it only for your own server.</p>
   <div class="radek">
    <input type="checkbox" id="autostart" name="autostart" {autostart}>
    <label for="autostart" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px">
-     Spouštět po startu počítače</label>
+     Start when the computer boots</label>
   </div>
   <div class="radek">
    <input type="checkbox" id="novytoken" name="novytoken">
    <label for="novytoken" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px">
-     Vyrobit nový token (starý přestane platit)</label>
+     Issue a new token (the old one stops working)</label>
   </div>
- <button type="submit">Uložit</button>
+ <button type="submit">Save</button>
  </form>
- <p class="hint">Token krabičky: <code>{token}</code><br>
-   Opište ho v aplikaci do <strong>Nastavení aplikace → Přihlásit krabičku</strong>.
-   Uložený je v <code>{config}</code>.</p>
+ <p class="hint">Box token: <code>{token}</code><br>
+   Copy it in the app into <strong>Application settings → Sign in the box</strong>.
+   It is stored in <code>{config}</code>.</p>
 
- <h1 style="font-size:15px;margin-top:28px">Diagnostika krabičky</h1>
- <p class="hint" style="margin-top:4px">Bez mazání dat ověří rozhraní,
-   broadcast adresy, port odpovědí decoderů a hodiny počítače.</p>
- <form method="post" action="/diagnostika"><button type="submit">Spustit diagnostiku</button></form>
+ <h1 style="font-size:15px;margin-top:28px">Box diagnostics</h1>
+ <p class="hint" style="margin-top:4px">Checks the interfaces, broadcast
+   addresses, decoder reply port and the computer clock — nothing is erased.</p>
+ <form method="post" action="/diagnostika"><button type="submit">Run diagnostics</button></form>
  {diagnostika}
 
- <h1 style="font-size:15px;margin-top:28px">Aktualizace</h1>
- <p class="hint" style="margin-top:4px">Nainstalováno <strong>{verze}</strong>, server nabízí
-   <strong>{nova_verze}</strong>. Původní soubor se uloží jako <code>.bak</code>.</p>
+ <h1 style="font-size:15px;margin-top:28px">Update</h1>
+ <p class="hint" style="margin-top:4px">Installed <strong>{verze}</strong>, the server offers
+   <strong>{nova_verze}</strong>. The original file is kept as <code>.bak</code>.</p>
  {aktualizace_tlacitko}
  {aktualizace_stav}
 
- <h1 style="font-size:15px;margin-top:28px">Zkusit spojení na železo</h1>
- <p class="hint" style="margin-top:4px">Ověří kabel a adresu <strong>bez serveru</strong> —
-   napište adresu dekodéru nebo kamery. Výsledek přibude do tabulky níž.</p>
+ <h1 style="font-size:15px;margin-top:28px">Try a connection to the hardware</h1>
+ <p class="hint" style="margin-top:4px">Checks the cable and the address <strong>without the
+   server</strong> — type the decoder or camera address. The result is added to the table below.</p>
  <form method="post" action="/zkusit">
-  <label for="host">Adresa a port</label>
+  <label for="host">Address and port</label>
   <div class="radek" style="margin-top:0">
    <input type="text" id="host" name="host" value="{zkouska_host}" placeholder="192.168.9.25"
           style="flex:1">
    <input type="text" name="port" value="{zkouska_port}" placeholder="5403"
           style="width:96px">
   </div>
-  <button type="submit">Zkusit</button>
+  <button type="submit">Try</button>
  </form>
 
- <h1 style="font-size:15px;margin-top:28px">Služba (doporučeno pro krabičku)</h1>
+ <h1 style="font-size:15px;margin-top:28px">Service (recommended for the box)</h1>
  <p class="hint" style="margin-top:4px">{sluzba}</p>
  {spojeni}
- <p class="hint"><a href="/">zpět na displej</a></p>
+ <p class="hint"><a href="/">back to the display</a></p>
 </main></body></html>"""
 
 
@@ -2420,18 +2553,18 @@ def _diagnostika_html() -> str:
     data = _diagnostika_snapshot
     interfaces = html.escape(", ".join(
         f"{row['address']}/{row['prefix']}" for row in data.get("interfaces", [])
-    ) or "žádné IPv4 rozhraní")
-    broadcasts = html.escape(", ".join(data.get("broadcasts", [])) or "žádné")
+    ) or "no IPv4 interface")
+    broadcasts = html.escape(", ".join(data.get("broadcasts", [])) or "none")
     port_class = "ok" if data.get("reply_port_ok") else "chyba"
-    port_text = "volný" if data.get("reply_port_ok") else (
-        html.escape(str(data.get("reply_port_error") or "obsazený"))
+    port_text = "free" if data.get("reply_port_ok") else (
+        html.escape(str(data.get("reply_port_error") or "in use"))
     )
     return (
         '<div class="panel">'
-        f"<strong>Rozhraní:</strong> {interfaces}<br>"
+        f"<strong>Interfaces:</strong> {interfaces}<br>"
         f"<strong>Broadcast:</strong> {broadcasts}<br>"
         f'<strong>UDP 5303:</strong> <span class="{port_class}">{port_text}</span><br>'
-        f"<strong>Hodiny krabičky:</strong> {html.escape(str(data.get('local', '—')))}"
+        f"<strong>Box clock:</strong> {html.escape(str(data.get('local', '—')))}"
         "</div>"
     )
 
@@ -2439,23 +2572,23 @@ def _diagnostika_html() -> str:
 def _stage_update(worker) -> str:
     """Stáhne, ověří a atomicky připraví nový soubor agenta."""
     if worker is None or not worker.connected:
-        return "Aktualizaci nelze stáhnout — krabička není připojená k serveru."
+        return "The update cannot be downloaded — the box is not connected to the server."
     if getattr(sys, "frozen", False):
-        return "Zabalenou aplikaci nelze aktualizovat jako Python soubor."
+        return "A packaged application cannot be updated as a Python file."
     try:
         payload = worker.server.download_agent()
     except (OSError, TimeoutError, urllib.error.URLError) as exc:
-        return f"Aktualizaci se nepodařilo stáhnout: {exc}"
+        return f"The update could not be downloaded: {exc}"
     expected = str(getattr(worker, "latest_sha256", "") or "").lower()
     if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
-        return "Aktualizace odmítnuta: server neposlal platný kontrolní součet."
+        return "Update refused: the server sent no valid checksum."
     digest = hashlib.sha256(payload).hexdigest()
     if digest != expected:
-        return "Aktualizace odmítnuta: kontrolní součet nesouhlasí."
+        return "Update refused: the checksum does not match."
     try:
         compile(payload, "track_agent.py", "exec")
     except SyntaxError as exc:
-        return f"Aktualizace odmítnuta: stažený program není platný ({exc})."
+        return f"Update refused: the downloaded program is not valid ({exc})."
     current = pathlib.Path(__file__).resolve()
     backup = current.with_suffix(current.suffix + ".bak")
     staged = current.with_suffix(current.suffix + ".new")
@@ -2465,25 +2598,29 @@ def _stage_update(worker) -> str:
             backup.write_bytes(current.read_bytes())
         staged.replace(current)
     except OSError as exc:
-        return f"Aktualizaci se nepodařilo uložit: {exc}"
-    return "Aktualizace je ověřená a uložená. Projeví se po restartu služby."
+        return f"The update could not be saved: {exc}"
+    return "The update is verified and saved. It takes effect after the service restarts."
 
 
 def _recent_table() -> str:
-    """Poslední spojení na dekodéry a kameru — co je vidět v nastavení."""
+    """Poslední spojení na dekodéry a kameru — co je vidět v nastavení.
+
+    Každá buňka se escapuje: `cil` i `detail` nesou text zvenčí (adresa
+    ze zkoušky spojení, text výjimky, příkaz ze serveru) — audit 23. 9. 2026.
+    """
     if not _recent:
         return ""
     rows = "".join(
         "<tr><td>{cas}</td><td>{cil}</td>"
         '<td class="stavbunka{trida}">{text}</td></tr>'.format(
-            cas=entry["cas"],
-            cil=entry["cil"],
+            cas=html.escape(str(entry["cas"])),
+            cil=html.escape(str(entry["cil"])),
             trida="" if entry["ok"] else " chyba",
-            text="odpovědělo" if entry["ok"] else (entry["detail"] or "neodpovědělo"),
+            text="answered" if entry["ok"] else html.escape(str(entry["detail"] or "no answer")),
         )
         for entry in _recent
     )
-    return "<table><tr><th>Kdy</th><th>Kam</th><th>Výsledek</th></tr>" + rows + "</table>"
+    return "<table><tr><th>When</th><th>Where</th><th>Result</th></tr>" + rows + "</table>"
 
 
 def _screen_state(worker, config: dict) -> dict:
@@ -2491,9 +2628,16 @@ def _screen_state(worker, config: dict) -> dict:
 
     David 24. 8. 2026 výslovně požaduje celý token i po spárování. Na malém
     displeji je to hlavní provozní informace; bezpečnost síťových příkazů proto
-    stojí i na omezení cílů na loopback a privátní IPv4 rozsahy.
+    stojí i na omezení cílů na privátní IPv4 rozsahy (bez loopbacku). Celý
+    token ale dostane jen tenhle počítač — viz `_token_pro_klienta`.
+
+    **Zelené OK jen nad živým vláknem** (audit 23. 9. 2026): `connected`
+    zůstalo `True` i po smrti vlákna agenta a displej svítil OK nad krabičkou,
+    která nic nepřeposílala.
     """
-    connected = bool(worker and worker.connected)
+    zije = getattr(worker, "is_running", None)
+    connected = bool(worker and worker.connected
+                     and (zije() if callable(zije) else True))
     token = (config.get("token") or "").strip()
 
     if connected:
@@ -2501,24 +2645,24 @@ def _screen_state(worker, config: dict) -> dict:
             "barva": "#84cc16", "zare": "rgba(80,255,30,.35)",
             "znak": "✓", "slovo": "OK",
             "detail": worker.status if worker else "",
-            "token_popisek": "Token krabičky:",
+            "token_popisek": "Box token:",
             "token": token or "—",
         }
     if not configured_server(config):
         return {
             "barva": "#eab308", "zare": "rgba(234,179,8,.35)",
-            "znak": "!", "slovo": "NASTAVIT",
-            "detail": "V nastavení krabičky je smazaná adresa aplikace.",
-            "token_popisek": "Token krabičky:", "token": token or "—",
+            "znak": "!", "slovo": "SET UP",
+            "detail": "The application address is missing in the box settings.",
+            "token_popisek": "Box token:", "token": token or "—",
         }
     # Červeně, ne žlutě: ČEKÁ znamená „ještě to nejede" a od zeleného OK se
     # musí lišit na první pohled i přes půlku závodiště. Žlutá zůstává
     # výjimečnému NASTAVIT.
     return {
         "barva": "#ef4444", "zare": "rgba(239,68,68,.35)",
-        "znak": "…", "slovo": "ČEKÁ",
-        "detail": (worker.status if worker else "čeká na schválení v aplikaci"),
-        "token_popisek": "Opište token do aplikace — bez pomlček:",
+        "znak": "…", "slovo": "WAITING",
+        "detail": (worker.status if worker else "waiting for approval in the app"),
+        "token_popisek": "Copy the token into the app — no dashes:",
         "token": token or "—",
     }
 
@@ -2553,9 +2697,29 @@ def _token_text(token: str) -> str:
 #: záměnu tokenu, a jen proti náhodnému doteku na displeji.
 #:
 #: Čtení a **diagnostika zůstávají odkudkoli**: displej má fungovat
-#: z notebooku a „Test spojení" i „Diagnostika sítě" obsluha před závodem
-#: potřebuje. Nic z toho nemění, na co je agent připojený.
-POST_JEN_MISTNE = ("/nastaveni", "/novy-token", "/aktualizovat")
+#: z notebooku a „Diagnostika sítě" obsluha před závodem potřebuje. Nic
+#: z toho nemění, na co je agent připojený.
+#:
+#: **„Zkusit spojení" už jen místně** (audit 23. 9. 2026): jeho adresa se
+#: ukládá a vrací do stránky, takže byla vstupem pro uložené XSS, a z LAN
+#: se přes něj dala krabičkou oskenovat klubová síť. Escapování XSS zavírá;
+#: tohle zavírá i to skenování. Z notebooku se spojení ověří z aplikace.
+POST_JEN_MISTNE = ("/nastaveni", "/novy-token", "/aktualizovat", "/zkusit")
+
+#: Strop těla POST (audit 23. 9. 2026). Formuláře krabičky mají desítky
+#: bajtů; `Content-Length` z hlavičky se dřív četl bez meze celý do paměti.
+MAX_TELO_POST = 64 * 1024
+
+#: Kolik vteřin smí klient mlčet uprostřed požadavku. Bez meze by pár
+#: otevřených a mlčících spojení drželo vlákna serveru napořád.
+WEB_TIMEOUT_S = 15.0
+
+#: Hlavička stránek krabičky. Skripty a styly jsou inline (displej nesmí
+#: záviset na CDN), takže `'unsafe-inline'` zůstává; zbytek zakazuje cizí
+#: zdroje, vložení stránky do rámu a odeslání formuláře jinam.
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+       "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
 
 
 def _je_z_tohoto_pocitace(adresa: str) -> bool:
@@ -2577,9 +2741,29 @@ def _meni_stav(cesta: str) -> bool:
     """
     if any(cesta.startswith(p) for p in POST_JEN_MISTNE):
         return True
-    return not any(
-        cesta.startswith(p) for p in ("/diagnostika", "/zkusit")
-    )
+    return not cesta.startswith("/diagnostika")
+
+
+def _cizi_puvod(hlavicky) -> bool:
+    """Přišel POST z cizí stránky (CSRF)?
+
+    Kontrola loopbacku nestačí (audit 23. 9. 2026): cizí web otevřený
+    v prohlížeči **na krabičce** pošle formulář z `127.0.0.1` taky. Prohlížeč
+    ale přiloží `Origin` / `Sec-Fetch-Site`, a ty musí sedět na tuhle
+    stránku. Bez hlaviček (curl, skripty na krabičce) se propouští —
+    to není prohlížeč, který by šlo podvrhnout cizí stránkou.
+    """
+    web = (hlavicky.get("Sec-Fetch-Site") or "").strip().lower()
+    if web in ("cross-site", "same-site"):
+        return True
+    puvod = (hlavicky.get("Origin") or "").strip()
+    if not puvod:
+        return False
+    if puvod.lower() == "null":
+        return True
+    cast = urllib.parse.urlsplit(puvod)
+    host = (hlavicky.get("Host") or "").strip().lower()
+    return cast.scheme not in ("http", "https") or cast.netloc.lower() != host
 
 
 def _novy_token_odjisten() -> bool:
@@ -2599,7 +2783,7 @@ def _tlacitko_html() -> str:
     odjisteno = _novy_token_odjisten()
     trida = "karta karta-tlacitko pozor" if odjisteno else "karta karta-tlacitko"
     nadpis = (
-        "KLEPNĚTE ZNOVU — STARÝ TOKEN PŘESTANE PLATIT" if odjisteno else "NOVÝ TOKEN"
+        "TAP AGAIN — THE OLD TOKEN STOPS WORKING" if odjisteno else "NEW TOKEN"
     )
     return (
         '<form method="post" action="/novy-token" style="display:contents">'
@@ -2610,7 +2794,19 @@ def _tlacitko_html() -> str:
     )
 
 
-def _stav_json(worker, config: dict) -> bytes:
+def _token_pro_klienta(token: str, plny: bool) -> str:
+    """Celý token jen tomuhle počítači, ostatním maskovaný.
+
+    Kiosk displeje krabičky běží na `127.0.0.1` (`kiosk/start-kiosk.sh`)
+    a celý token dál ukazuje (David 24. 8. 2026). Stránka ale poslouchá
+    na `0.0.0.0`, aby se na ni dalo koukat z notebooku — a do 1.14 tak
+    dostal celý token **kdokoli v klubové síti** přes `/stav` (audit
+    23. 9. 2026). Stejně to dělá Edge.
+    """
+    return token if plny else maskuj_token(token)
+
+
+def _stav_json(worker, config: dict, *, plny_token: bool = False) -> bytes:
     """Stav displeje jako JSON — z něj si obrazovka bere všechno živé.
 
     Displej se **neobnovuje celou stránkou** (návrh Ri5 v2 má tikající hodiny
@@ -2628,7 +2824,7 @@ def _stav_json(worker, config: dict) -> bytes:
             "znak": state["znak"],
             "slovo": state["slovo"],
             "detail": state["detail"],
-            "token": _token_text(state["token"]),
+            "token": _token_text(_token_pro_klienta(state["token"], plny_token)),
             "token_popisek": state["token_popisek"],
             "smycka": prujezdy["smycka"],
             "server": prujezdy["server"],
@@ -2644,36 +2840,38 @@ def _stav_json(worker, config: dict) -> bytes:
     ).encode("utf-8")
 
 
-def _render_screen(worker, config: dict) -> bytes:
+def _render_screen(worker, config: dict, *, plny_token: bool = False) -> bytes:
+    # Všechno, co se sází do HTML, se escapuje (audit 23. 9. 2026): `detail`
+    # nese stav agenta a ten text výjimek a odpovědí serveru.
     state = _screen_state(worker, config)
     style = _STYLE.format(barva=state["barva"], zare=state["zare"])
     prujezdy = _prujezdy_stav()
     now = time.localtime()
     page = _SCREEN.format(
-        nadpis="BIKODY.COM — krabička u trati",
+        nadpis="BIKODY.COM — trackside box",
         styl=style,
         # První vykreslení nese stav diod samo: než dojde první odpověď
         # `/stav`, byla by obrazovka po restartu kiosku vždycky tmavá —
         # i uprostřed závodu, kdy průjezdy chodí.
         dioda_smycka="dioda zelena" if prujezdy["smycka"] else "dioda",
         dioda_server="dioda modra" if prujezdy["server"] else "dioda",
-        text_smycka="SIGNÁL PŘIJAT" if prujezdy["smycka"] else "ČEKÁM NA PRŮJEZD",
+        text_smycka="SIGNAL RECEIVED" if prujezdy["smycka"] else "WAITING FOR A PASSING",
         trida_smycka="hodnota zeleno" if prujezdy["smycka"] else "hodnota",
         text_server=(
-            "ODESLÁNO" if prujezdy["server"]
-            else ("ODESÍLÁM…" if prujezdy["smycka"] else "PŘIPRAVEN")
+            "SENT" if prujezdy["server"]
+            else ("SENDING…" if prujezdy["smycka"] else "READY")
         ),
         trida_server=(
             "hodnota modro" if prujezdy["server"]
             else ("hodnota oranzovo" if prujezdy["smycka"] else "hodnota")
         ),
-        znak=state["znak"],
-        slovo=state["slovo"],
-        detail=state["detail"],
-        token_popisek=state["token_popisek"],
-        token=_token_text(state["token"]),
+        znak=html.escape(state["znak"]),
+        slovo=html.escape(state["slovo"]),
+        detail=html.escape(str(state["detail"])),
+        token_popisek=html.escape(state["token_popisek"]),
+        token=html.escape(_token_text(_token_pro_klienta(state["token"], plny_token))),
         tlacitko=_tlacitko_html(),
-        posledni=prujezdy["naposledy"] or "--:--:--",
+        posledni=html.escape(prujezdy["naposledy"] or "--:--:--"),
         cas=time.strftime("%d.%m.%Y %H:%M:%S", now),
         cas_hodiny=time.strftime("%H:%M:%S", now),
         cas_datum=time.strftime("%d.%m.%Y", now),
@@ -2690,45 +2888,52 @@ def _service_hint() -> str:
     """
     if not sys.platform.startswith("linux"):
         return (
-            "Na tomhle systému se služba neinstaluje — agenta drží volba "
-            "„Spouštět po startu počítače“ výše."
+            "On this system the service is not installed — the agent is held by the "
+            "\"Start when the computer boots\" option above."
         )
     state = service_state()
     if not state:
         return (
-            "Není nainstalovaná. Agent se po pádu sám nevrátí. Na krabičce ji "
-            "zapněte příkazem <code>sudo python3 track_agent.py "
-            "--install-service</code> — pak vstane po pádu i po restartu."
+            "Not installed. The agent will not come back after a crash. On the box, "
+            "turn it on with <code>sudo python3 track_agent.py "
+            "--install-service</code> — then it rises after a crash and a reboot."
         )
     if state == "active":
-        return "Běží jako služba (<code>Restart=always</code>) — po pádu i po restartu se vrátí sama."
+        return "Running as a service (<code>Restart=always</code>) — it returns after a crash and a reboot."
     return (
-        f"Nainstalovaná, ale systemd hlásí <code>{state}</code>. "
+        f"Installed, but systemd reports <code>{html.escape(state)}</code>. "
         "Log: <code>journalctl -u bikody-agent.service -f</code>"
     )
 
 
-def _render_settings(worker, config: dict) -> bytes:
+def _render_settings(worker, config: dict, *, plny_token: bool = False) -> bytes:
+    """Stránka nastavení. **Každá vložená hodnota se escapuje.**
+
+    Do 1.14 šla adresa ze „Zkusit spojení" do `value="…"` tak, jak přišla,
+    a kdokoli v síti tak do stránky vložil vlastní skript (uložené XSS,
+    audit 23. 9. 2026). Ven sem teče i stav agenta (text výjimek), verze
+    od serveru a tabulka spojení.
+    """
     latest = getattr(worker, "latest_version", VERSION) if worker else VERSION
     update_available = latest and latest != VERSION
     update_button = (
         '<form method="post" action="/aktualizovat"><button type="submit">'
-        "Stáhnout a připravit aktualizaci</button></form>"
-        if update_available else '<p class="hint ok">Agent je aktuální.</p>'
+        "Download and stage the update</button></form>"
+        if update_available else '<p class="hint ok">The agent is up to date.</p>'
     )
     page = _SETTINGS.format(
-        stav=(worker.status if worker else "nespuštěno"),
-        server=configured_server(config),
+        stav=html.escape(str(worker.status if worker else "not started")),
+        server=html.escape(configured_server(config)),
         autostart="checked" if config.get("autostart") else "",
-        token=(config.get("token") or "—"),
-        config=config_path(),
+        token=html.escape(_token_pro_klienta(config.get("token") or "—", plny_token)),
+        config=html.escape(str(config_path())),
         sluzba=_service_hint(),
-        zkouska_host=_posledni_zkouska.get("host", ""),
-        zkouska_port=_posledni_zkouska.get("port", ""),
+        zkouska_host=html.escape(str(_posledni_zkouska.get("host", ""))),
+        zkouska_port=html.escape(str(_posledni_zkouska.get("port", ""))),
         spojeni=_recent_table(),
         diagnostika=_diagnostika_html(),
-        verze=VERSION,
-        nova_verze=latest or "neznámá",
+        verze=html.escape(VERSION),
+        nova_verze=html.escape(str(latest or "unknown")),
         aktualizace_tlacitko=update_button,
         aktualizace_stav=(
             f'<div class="panel">{html.escape(_aktualizace_stav)}</div>'
@@ -2744,8 +2949,16 @@ def build_web_server(state: dict, *, host: str, port: int):
     import urllib.parse
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        # `StreamRequestHandler` nastaví soketu timeout (audit 23. 9. 2026).
+        timeout = WEB_TIMEOUT_S
+
         def log_message(self, *_args):
             pass                       # vlastní log stačí, přístupy nikoho nezajímají
+
+        def _mistni(self) -> bool:
+            return _je_z_tohoto_pocitace(
+                self.client_address[0] if self.client_address else ""
+            )
 
         def handle(self):
             """Klient, který odejde uprostřed odpovědi, není chyba.
@@ -2769,6 +2982,9 @@ def build_web_server(state: dict, *, host: str, port: int):
             if not any(name.lower() == "content-type" for name, _ in hlavicky):
                 hlavicky.insert(0, ("Content-Type", "text/html; charset=utf-8"))
             self.send_header("Content-Length", str(len(body)))
+            if not any(name.lower() == "content-security-policy" for name, _ in hlavicky):
+                hlavicky.append(("Content-Security-Policy", CSP))
+                hlavicky.append(("X-Content-Type-Options", "nosniff"))
             for name, value in hlavicky:
                 self.send_header(name, value)
             self.end_headers()
@@ -2776,42 +2992,63 @@ def build_web_server(state: dict, *, host: str, port: int):
 
         def do_GET(self):              # noqa: N802 — jméno určuje knihovna
             config = load_config()
+            mistni = self._mistni()
             if self.path.startswith("/nastaveni"):
-                self._send(_render_settings(state.get("worker"), config))
+                self._send(_render_settings(state.get("worker"), config, plny_token=mistni))
                 return
             if self.path.startswith("/stav"):
                 # Živý stav displeje. Bez cache: obrazovka se ptá po sekundě
                 # a kiosk prohlížeč by jinak servíroval první odpověď pořád.
                 self._send(
-                    _stav_json(state.get("worker"), config),
+                    _stav_json(state.get("worker"), config, plny_token=mistni),
                     headers=[
                         ("Content-Type", "application/json; charset=utf-8"),
                         ("Cache-Control", "no-store"),
                     ],
                 )
                 return
-            self._send(_render_screen(state.get("worker"), config))
+            self._send(_render_screen(state.get("worker"), config, plny_token=mistni))
+
+        def _odmitni(self, status: int, text: str) -> None:
+            # Tělo se nečte, takže spojení se po odpovědi zavře — zbytek
+            # dat v soketu by se jinak přečetl jako další požadavek.
+            self.close_connection = True
+            self._send(
+                text.encode("utf-8"),
+                status=status,
+                headers=[("Content-Type", "text/plain; charset=utf-8"),
+                         ("Connection", "close")],
+            )
 
         def do_POST(self):             # noqa: N802
             global _aktualizace_stav, _diagnostika_snapshot
-            length = int(self.headers.get("Content-Length") or 0)
-            form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
-            saved = load_config()
-
-            # Zápis nastavení jen z tohohle počítače (viz `POST_JEN_MISTNE`).
-            # Tělo se přečte **dřív**, jinak by odmítnutý požadavek nechal
-            # data v soketu a prohlížeč by dostal reset místo odpovědi.
-            if _meni_stav(self.path) and not _je_z_tohoto_pocitace(
-                self.client_address[0] if self.client_address else ""
-            ):
+            # Kontroly **před čtením těla** (audit 23. 9. 2026): odmítnutý
+            # požadavek nemá co krabičce posílat do paměti. Do 1.14 se
+            # nejdřív četlo celé tělo podle hlavičky, bez stropu.
+            if _meni_stav(self.path) and not self._mistni():
                 log(f"Odmítnut zápis z {self.client_address[0]}: {self.path}")
-                self._send(
-                    "Nastavení krabičky se mění jen na ní samotné. "
-                    "Z jiného počítače je stránka jen ke čtení.".encode("utf-8"),
-                    status=403,
-                    headers=[("Content-Type", "text/plain; charset=utf-8")],
+                self._odmitni(
+                    403,
+                    "The box settings are changed on the box itself. "
+                    "From another computer the page is read-only.",
                 )
                 return
+            if _cizi_puvod(self.headers):
+                log(f"Odmítnut POST z cizí stránky ({self.headers.get('Origin')}): {self.path}")
+                self._odmitni(403, "Cross-origin requests are not accepted.")
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._odmitni(400, "Invalid Content-Length.")
+                return
+            if length < 0 or length > MAX_TELO_POST:
+                self._odmitni(413, "The request is too large.")
+                return
+            form = urllib.parse.parse_qs(
+                self.rfile.read(length).decode("utf-8", errors="replace")
+            )
+            saved = load_config()
 
             if self.path.startswith("/diagnostika"):
                 _diagnostika_snapshot = network_info({})
@@ -2829,12 +3066,12 @@ def build_web_server(state: dict, *, host: str, port: int):
                 # zrovna mimo (David, 19. 8. 2026).
                 host = (form.get("host", [""])[0] or "").strip()
                 raw_port = (form.get("port", [""])[0] or "").strip()
-                _posledni_zkouska["host"] = host
-                _posledni_zkouska["port"] = raw_port
+                _posledni_zkouska["host"] = host[:64]
+                _posledni_zkouska["port"] = raw_port[:8]
                 try:
                     port = int(raw_port)
                 except ValueError:
-                    _remember(host or "—", 0, False, "port není číslo")
+                    _remember(host or "—", 0, False, "the port is not a number")
                 else:
                     # `tcp_probe` výsledek nevrací — úspěch i selhání zapisuje
                     # `_remember`, takže se objeví v tabulce níž. Výjimka tady
@@ -2858,7 +3095,7 @@ def build_web_server(state: dict, *, host: str, port: int):
                         configured_server(saved), token,
                         autostart=bool(saved.get("autostart")),
                     )
-                    log("Vydán nový token z displeje krabičky")
+                    log("A new token was issued from the box display")
                     worker = state.get("worker")
                     if worker is not None:
                         worker.stop()
@@ -2907,6 +3144,30 @@ def build_web_server(state: dict, *, host: str, port: int):
     return TichyServer((host, port), Handler)
 
 
+#: Jak často hlídač kontroluje, že vlákno agenta žije.
+HLIDAC_S = 5.0
+
+
+def _hlidej_workera(state: dict, *, konec=None) -> None:
+    """Umřelé vlákno agenta = konec procesu s nenulovým kódem.
+
+    Webový server běží v hlavním vlákně, takže smrt vlákna `agent` proces
+    neukončila: displej svítil, systemd neměl co restartovat a krabička
+    mlčky nepřeposílala (audit 23. 9. 2026). `Restart=always` v unitu
+    proces zvedne a agent naběhne čistý. Worker vyměněný za nový (nový
+    token, jiný server) se nepočítá — ten starý byl zastaven záměrně.
+    """
+    konec = konec or (lambda: os._exit(1))
+    while True:
+        time.sleep(HLIDAC_S)
+        worker = state.get("worker")
+        umrel = getattr(worker, "umrel", None)
+        if callable(umrel) and umrel():
+            log("The agent thread died — exiting so the service restarts it")
+            konec()
+            return
+
+
 def serve_web(state: dict, *, host: str, port: int) -> None:
     server = build_web_server(state, host=host, port=port)
     shown = host if host != "0.0.0.0" else "adresa-teto-krabicky"
@@ -2915,48 +3176,48 @@ def serve_web(state: dict, *, host: str, port: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Agent u trati pro BIKODY")
+    parser = argparse.ArgumentParser(description="Trackside agent for BIKODY")
     parser.add_argument(
         "--server",
         default=os.environ.get("BIKODY_SERVER", ""),
-        help=f"Adresa aplikace (výchozí {DEFAULT_SERVER})",
+        help=f"Application address (default {DEFAULT_SERVER})",
     )
     parser.add_argument(
         "--token",
         default=os.environ.get("BIKODY_AGENT_TOKEN", ""),
-        help="Token agenta z Nastavení aplikace",
+        help="Agent token from Application settings",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Jen přeposílání, bez stránky s nastavením (služba, systemd).",
+        help="Forwarding only, without the settings page (service, systemd).",
     )
     parser.add_argument(
         "--web-port",
         type=int,
         default=WEB_PORT,
-        help=f"Port stránky s nastavením (výchozí {WEB_PORT}).",
+        help=f"Port of the settings page (default {WEB_PORT}).",
     )
     parser.add_argument(
         "--web-host",
         default="127.0.0.1",
         help=(
-            "Na které adrese stránku nabízet. Výchozí je jen tenhle počítač; "
-            "krabička u trati potřebuje 0.0.0.0, aby se na ni dalo z jiného stroje."
+            "Which address to serve the page on. The default is this computer only; "
+            "the trackside box needs 0.0.0.0 so it can be reached from another machine."
         ),
     )
     parser.add_argument(
         "--install-service",
         action="store_true",
         help=(
-            "Zapíše a zapne službu systemd s automatickým restartem — "
-            "krabička u trati po pádu i po restartu vstane sama."
+            "Writes and enables a systemd service with automatic restart — "
+            "the trackside box rises by itself after a crash and a reboot."
         ),
     )
     parser.add_argument(
         "--uninstall-service",
         action="store_true",
-        help="Službu vypne a smaže (pro notebook, kde agenta spouští obsluha).",
+        help="Disables and removes the service (for a laptop, where the operator starts the agent).",
     )
     args = parser.parse_args(argv)
 
@@ -2972,13 +3233,13 @@ def main(argv: list[str] | None = None) -> int:
     # dotykovém displeji, což nikdo nechce.
     token = args.token or ensure_token(saved)
 
-    log(f"Agent {VERSION} startuje")
+    log(f"Agent {VERSION} is starting")
 
     if args.headless:
         # Čistý přeposílač: nastavení přišlo z prostředí nebo ze souboru a
         # měnit se nemá. Tak běží služba na serveru.
         if not server_url or not token:
-            parser.error("Chybí --server nebo --token (jde je předat i přes prostředí).")
+            parser.error("Missing --server or --token (they can also be passed through the environment).")
         worker = Worker(server_url, token)
         worker.start()
         try:
@@ -2986,8 +3247,10 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(0.5)
         except KeyboardInterrupt:
             worker.stop()
-            log("Konec.")
-        return 0
+            log("Done.")
+            return 0
+        # Vlákno skončilo samo = chyba; nenulový kód, ať systemd restartuje.
+        return 1 if worker.umrel() else 0
 
     # Jinak se agent obsluhuje stránkou: token se vloží v prohlížeči, ne
     # přepisováním souborů. Na krabičce u trati je to jediná obsluha, kterou má.
@@ -2997,8 +3260,10 @@ def main(argv: list[str] | None = None) -> int:
         worker.start()
         state["worker"] = worker
     else:
-        log("Zatím není zadaná adresa aplikace — doplňte ji v nastavení krabičky.")
+        log("No application address yet — add it in the box settings.")
 
+    threading.Thread(target=_hlidej_workera, args=(state,), name="hlidac",
+                     daemon=True).start()
     try:
         serve_web(state, host=args.web_host, port=args.web_port)
     except KeyboardInterrupt:
@@ -3006,7 +3271,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if state.get("worker") is not None:
             state["worker"].stop()
-    log("Konec.")
+    log("Done.")
     return 0
 
 
