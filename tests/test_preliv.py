@@ -134,30 +134,7 @@ def test_pruh_prelivu_je_na_displeji_a_rika_ze_doleti_sam():
     assert ".preliv {{" in ta._STYLE
 
 
-# --- drátování: co dělá `_pump`, když server nebere ---------------------------
-
-
-class _FalesnySocket:
-    """Dekodér, který jednou vysype rámce a pak mlčí.
-
-    Mlčení je `socket.timeout` — přesně to, co dělá skutečný socket, když
-    z trati nic nejede. Bez něj by se `_pump` točil v prázdné smyčce.
-    """
-
-    def __init__(self, davky):
-        self._davky = list(davky)
-        self.odeslano = []
-
-    def settimeout(self, _t):
-        pass
-
-    def recv(self, _kolik):
-        if self._davky:
-            return self._davky.pop(0)
-        raise TimeoutError()
-
-    def sendall(self, data):
-        self.odeslano.append(data)
+# --- drátování: co dělá linka, když server nebere ------------------------------
 
 
 class _NeberouciServer:
@@ -178,11 +155,6 @@ class _BerouciServer:
     def push_passings(self, decoder_id, batch, casy=None):
         self.davky.append(list(batch))
         return {"ok": True, "stored": len(batch)}
-
-
-def _ramec(cislo: int) -> bytes:
-    """Rámec SOR…EOR — obsah je krabičce jedno, P3 nezná."""
-    return bytes([ta.STREAM_SOR]) + f"{cislo:04d}".encode("ascii") + bytes([ta.STREAM_EOR])
 
 
 def _link(server, tmp_path):
