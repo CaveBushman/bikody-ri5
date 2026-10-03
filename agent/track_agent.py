@@ -51,7 +51,7 @@ import urllib.request
 #: (rozhodnutí 21. 9. 2026). 1.15: opravy z auditu 23. 9. 2026 — escapování
 #: stránek, token celý jen pro tento počítač, hlídání pracovních vláken,
 #: atomický zápis nastavení, žádné příkazy na loopback, strop těla požadavku.
-VERSION = "1.15"
+VERSION = "1.16"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -275,6 +275,18 @@ class Server:
             timeout=15.0,
         )
 
+    # Fotofiniš kamera (Davidovo zadání 3. 10. 2026): nastavení je hardware
+    # organizace a drží ho server; krabička ho jen čte, zapisuje a umí
+    # požádat o znovuposlání poslední startovky.
+    def camera(self) -> dict:
+        return self._request("/camera/", timeout=10.0)
+
+    def camera_save(self, host: str, port: int) -> dict:
+        return self._request("/camera/", {"host": host, "port": port}, timeout=10.0)
+
+    def camera_resend(self) -> dict:
+        return self._request("/camera/resend/", {"resend": True}, timeout=30.0)
+
     def download_agent(self) -> bytes:
         """Stáhne novou verzi ze stejného serveru jako řídicí API."""
         request = urllib.request.Request(
@@ -405,6 +417,75 @@ def tcp_probe(args: dict) -> dict:
         return {}
     _connection(host, port, timeout)
     return {}
+
+
+# --- fotofiniš kamera --------------------------------------------------------
+#
+# Startovky přijímá **software OPTIc3** na počítači u kamery (XML socket,
+# výchozí port 4532), ne samotná kamera. Krabička jen hlídá, jestli na té
+# adrese někdo poslouchá: spojení otevře a **hned zavře** — nedrží ho jako
+# u dekodéru (`tcp_probe`), protože OPTIc3 čeká jednu zprávu na spojení.
+
+#: Co krabička o kameře ví — nastavení ze serveru a poslední zkouška.
+_kamera: dict = {"host": "", "port": 0, "export": False, "last": None,
+                 "ok": None, "chyba": "", "kdy": "", "zprava": ""}
+_kamera_lock = threading.Lock()
+KAMERA_KONTROLA_S = 60.0
+
+
+def zkus_kameru(host: str, port: int) -> tuple[bool, str]:
+    """Poslouchá OPTIc3 na té adrese? Otevře a zavře spojení, nic nepošle."""
+    try:
+        host, port = _validated_target(host, int(port))
+        with socket.create_connection((host, port), timeout=2.0):
+            pass
+    except (OSError, ValueError) as exc:
+        return False, str(exc) or exc.__class__.__name__
+    return True, ""
+
+
+def _uloz_stav_kamery(info: dict | None = None, *, ok=None, chyba: str = "", zprava=None) -> None:
+    with _kamera_lock:
+        if info is not None:
+            _kamera.update({k: info.get(k) for k in ("host", "port", "export", "last") if k in info})
+        if ok is not None:
+            _kamera["ok"] = ok
+            _kamera["chyba"] = chyba
+            _kamera["kdy"] = time.strftime("%H:%M:%S")
+        if zprava is not None:
+            _kamera["zprava"] = zprava
+
+
+def stav_kamery() -> dict:
+    with _kamera_lock:
+        return dict(_kamera)
+
+
+def obnov_kameru(worker) -> None:
+    """Načte nastavení ze serveru a vyzkouší adresu. Výpadek nevadí."""
+    server = getattr(worker, "server", None)
+    if server is not None and getattr(worker, "connected", False):
+        try:
+            _uloz_stav_kamery(server.camera())
+        except Exception as exc:  # noqa: BLE001 — starý server nebo výpadek sítě
+            log(f"Kamera: nastavení ze serveru nepřišlo ({exc})")
+    stav = stav_kamery()
+    if stav.get("host"):
+        ok, chyba = zkus_kameru(stav["host"], stav.get("port") or 4532)
+        _uloz_stav_kamery(ok=ok, chyba=chyba)
+
+
+def _hlidej_kameru(state: dict, *, konec=None) -> None:
+    """Jednou za minutu: nastavení kamery ze serveru a zkouška spojení."""
+    while not (konec and konec.is_set()):
+        try:
+            obnov_kameru(state.get("worker"))
+        except Exception as exc:  # noqa: BLE001 — hlídač nesmí umřít
+            log(f"Kamera: kontrola selhala ({exc})")
+        if konec is not None:
+            konec.wait(KAMERA_KONTROLA_S)
+        else:
+            time.sleep(KAMERA_KONTROLA_S)
 
 
 def tcp_send(args: dict) -> dict:
@@ -2223,6 +2304,12 @@ _STYLE = """
             font-size:clamp(.6rem,1.3vw,.9rem); text-align:center; }}
  .preliv strong {{ color:#fff; }}
 
+ /* Fotofiniš kamera (3. 10. 2026) — tlumeně: je to informace, ne poplach. */
+ .kamera {{ margin-top:10px; padding:8px 12px; border-radius:8px;
+            background:#111827; color:#cbd5e1; font-weight:800;
+            font-size:clamp(.6rem,1.3vw,.9rem); text-align:center; }}
+ .kamera strong {{ color:#fff; }} .kamera .ok {{ color:#3fb950; }} .kamera .chyba {{ color:#f85149; }}
+
  /* Malé SPI displeje (MHS35: 480×320). Spodní mez clamp() je stavěná na
     monitor — tady by token, kvůli kterému displej existuje, skončil pod
     spodním okrajem. Ustupuje všechno kromě tokenu a diod. */
@@ -2341,6 +2428,13 @@ _SCREEN = """<!doctype html>
   THEY GO OUT BY THEMSELVES ONCE THE SERVER ANSWERS
  </div>
 
+ <!-- Fotofiniš kamera (3. 10. 2026): jen když je nastavená. Říká, jestli
+      software OPTIc3 přijímá startovky a kdy odešla poslední. -->
+ <div id="kamera-pruh" class="kamera" hidden>
+  &#128247;&nbsp;CAMERA <strong id="kamera-adresa"></strong> —
+  <span id="kamera-stav"></span><span id="kamera-posledni"></span>
+ </div>
+
  <footer class="paticka">
   <span class="vlevo">&#8635;&nbsp;LAST PASSING: <strong id="posledni">{posledni}</strong></span>
   <span>AGENT <strong id="verze">{verze}</strong></span>
@@ -2412,6 +2506,20 @@ _SCREEN = """<!doctype html>
     prelivPruh.hidden = preliv <= 0;
     if (preliv > 0) {{
       document.getElementById("preliv-pocet").textContent = String(preliv);
+    }}
+    var kamera = data.kamera;
+    var kameraPruh = document.getElementById("kamera-pruh");
+    if (kameraPruh) {{
+      kameraPruh.hidden = !kamera;
+      if (kamera) {{
+        document.getElementById("kamera-adresa").textContent = kamera.adresa;
+        var kStav = document.getElementById("kamera-stav");
+        kStav.textContent = kamera.ok === true ? "OPTIc3 LISTENING"
+          : (kamera.ok === false ? "OPTIc3 NOT LISTENING" : "NOT TESTED");
+        kStav.className = kamera.ok === true ? "ok" : (kamera.ok === false ? "chyba" : "");
+        document.getElementById("kamera-posledni").textContent =
+          kamera.posledni ? " · LAST START LIST " + kamera.posledni : "";
+      }}
     }}
     document.getElementById("znak").textContent = data.znak;
     document.getElementById("slovo").textContent = data.slovo;
@@ -2532,6 +2640,12 @@ _SETTINGS = """<!doctype html>
   </div>
   <button type="submit">Try</button>
  </form>
+
+ <h1 style="font-size:15px;margin-top:28px">Photo-finish camera</h1>
+ <p class="hint" style="margin-top:4px">Start lists go to the <strong>OPTIc3 software</strong>
+   on the camera computer (XML socket, default port 4532) — not to the camera head itself.
+   The address is stored in the app for the whole organisation.</p>
+ {kamera}
 
  <h1 style="font-size:15px;margin-top:28px">Service (recommended for the box)</h1>
  <p class="hint" style="margin-top:4px">{sluzba}</p>
@@ -2704,7 +2818,7 @@ def _token_text(token: str) -> str:
 #: ukládá a vrací do stránky, takže byla vstupem pro uložené XSS, a z LAN
 #: se přes něj dala krabičkou oskenovat klubová síť. Escapování XSS zavírá;
 #: tohle zavírá i to skenování. Z notebooku se spojení ověří z aplikace.
-POST_JEN_MISTNE = ("/nastaveni", "/novy-token", "/aktualizovat", "/zkusit")
+POST_JEN_MISTNE = ("/nastaveni", "/novy-token", "/aktualizovat", "/zkusit", "/kamera")
 
 #: Strop těla POST (audit 23. 9. 2026). Formuláře krabičky mají desítky
 #: bajtů; `Content-Length` z hlavičky se dřív četl bez meze celý do paměti.
@@ -2806,6 +2920,20 @@ def _token_pro_klienta(token: str, plny: bool) -> str:
     return token if plny else maskuj_token(token)
 
 
+def _kamera_pro_displej() -> dict | None:
+    """Řádek kamery na displeji — jen když je kamera nastavená."""
+    stav = stav_kamery()
+    if not stav.get("host"):
+        return None
+    last = stav.get("last") or {}
+    return {
+        "adresa": f"{stav['host']}:{stav.get('port') or 4532}",
+        "ok": stav.get("ok"),
+        "posledni": last.get("sent_at") or "",
+        "jizda": last.get("heat") or "",
+    }
+
+
 def _stav_json(worker, config: dict, *, plny_token: bool = False) -> bytes:
     """Stav displeje jako JSON — z něj si obrazovka bere všechno živé.
 
@@ -2835,6 +2963,7 @@ def _stav_json(worker, config: dict, *, plny_token: bool = False) -> bytes:
             "zahozeno_kdy": prujezdy["zahozeno_kdy"],
             "odjisteno": _novy_token_odjisten(),
             "verze": VERSION,
+            "kamera": _kamera_pro_displej(),
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -2939,8 +3068,48 @@ def _render_settings(worker, config: dict, *, plny_token: bool = False) -> bytes
             f'<div class="panel">{html.escape(_aktualizace_stav)}</div>'
             if _aktualizace_stav else ""
         ),
+        kamera=_kamera_html(),
     )
     return page.encode("utf-8")
+
+
+def _kamera_html() -> str:
+    """Sekce kamery v nastavení. **Každá hodnota se escapuje** (jako zbytek)."""
+    stav = stav_kamery()
+    e = html.escape
+    if stav.get("ok") is True:
+        vysledek = f'<span class="ok">OPTIc3 is listening</span> ({e(stav.get("kdy") or "")})'
+    elif stav.get("ok") is False:
+        vysledek = (f'<span class="chyba">Nobody is listening — enable the XML socket in OPTIc3 '
+                    f'(ATL Exchange Settings)</span><br>{e(stav.get("chyba") or "")} '
+                    f'({e(stav.get("kdy") or "")})')
+    else:
+        vysledek = "Not tested yet."
+    last = stav.get("last") or {}
+    posledni = (f'{e(last.get("sent_at", ""))} — {e(last.get("heat", ""))}'
+                f' ({e(last.get("event", ""))})' if last else "none yet")
+    prenos = ('<span class="ok">on</span>' if stav.get("export")
+              else '<span class="chyba">off — switch it on in the app (organisation settings)</span>')
+    zprava = f'<div class="panel">{e(stav["zprava"])}</div>' if stav.get("zprava") else ""
+    return f"""<div class="panel">
+  <strong>Status:</strong> {vysledek}<br>
+  <strong>Sending start lists:</strong> {prenos}<br>
+  <strong>Last start list:</strong> {posledni}
+ </div>
+ {zprava}
+ <form method="post" action="/kamera">
+  <label for="kamera-host">OPTIc3 computer — address and port</label>
+  <div class="radek" style="margin-top:0">
+   <input type="text" id="kamera-host" name="host" value="{e(str(stav.get("host") or ""))}"
+          placeholder="192.168.9.33" style="flex:1">
+   <input type="text" name="port" value="{e(str(stav.get("port") or 4532))}" style="width:96px">
+  </div>
+  <button type="submit">Save to the app</button>
+ </form>
+ <form method="post" action="/kamera-test" style="display:inline-block;margin-right:8px">
+  <button type="submit">Test the connection</button></form>
+ <form method="post" action="/kamera-znovu" style="display:inline-block">
+  <button type="submit">Resend the last start list</button></form>"""
 
 
 def build_web_server(state: dict, *, host: str, port: int):
@@ -3060,6 +3229,39 @@ def build_web_server(state: dict, *, host: str, port: int):
                 self._send(b"", status=303, headers=[("Location", "/nastaveni")])
                 return
 
+            if self.path.startswith("/kamera"):
+                # Kamera (3. 10. 2026): uložení adresy do aplikace, zkouška
+                # spojení na OPTIc3 a znovuposlání poslední startovky.
+                worker = state.get("worker")
+                server = getattr(worker, "server", None)
+                try:
+                    if self.path.startswith("/kamera-test"):
+                        obnov_kameru(worker)
+                        _uloz_stav_kamery(zprava="")
+                    elif self.path.startswith("/kamera-znovu"):
+                        if server is None:
+                            raise OSError("the box is not connected to the app")
+                        odpoved = server.camera_resend()
+                        _uloz_stav_kamery(zprava=(
+                            f"Start list sent: {odpoved.get('heat', '')}" if odpoved.get("ok")
+                            else f"Not sent: {odpoved.get('error', '')}"))
+                        obnov_kameru(worker)
+                    else:
+                        host = (form.get("host", [""])[0] or "").strip()
+                        port = int((form.get("port", ["4532"])[0] or "4532").strip())
+                        _validated_target(host, port)
+                        if server is None:
+                            raise OSError("the box is not connected to the app")
+                        _uloz_stav_kamery(server.camera_save(host, port), zprava="Saved to the app.")
+                        ok, chyba = zkus_kameru(host, port)
+                        _uloz_stav_kamery(ok=ok, chyba=chyba)
+                except urllib.error.HTTPError as exc:
+                    _uloz_stav_kamery(zprava=f"The app refused it (HTTP {exc.code}).")
+                except (OSError, ValueError) as exc:
+                    _uloz_stav_kamery(zprava=f"Failed: {exc}")
+                self._send(b"", status=303, headers=[("Location", "/nastaveni")])
+                return
+
             if self.path.startswith("/zkusit"):
                 # Test spojení **bez serveru**: obsluha u trati potřebuje před
                 # závodem vědět, že kabel a adresa sedí, i když je internet
@@ -3170,6 +3372,7 @@ def _hlidej_workera(state: dict, *, konec=None) -> None:
 
 def serve_web(state: dict, *, host: str, port: int) -> None:
     server = build_web_server(state, host=host, port=port)
+    threading.Thread(target=_hlidej_kameru, args=(state,), name="kamera", daemon=True).start()
     shown = host if host != "0.0.0.0" else "adresa-teto-krabicky"
     log(f"Displej krabičky: http://{shown}:{port}/")
     server.serve_forever()
