@@ -329,4 +329,4 @@ def test_prikaz_na_loopback_odmitnut(monkeypatch):
 
 
 def test_verze_zvednuta():
-    assert ta.VERSION == "1.15"
+    assert ta.VERSION == "1.17"

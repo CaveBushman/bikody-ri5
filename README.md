@@ -221,6 +221,7 @@ s novým serverem nerozbije — server mu nechá rychlé stahování po 1,5 s.
 ## Síť
 
 Krabička musí **vidět dekodéry a kameru** a **dostat se ven na HTTPS**. Nic víc.
+Kolik dotazů a jak často posílá, je v `docs/SIT-A-ZATIZENI.md`.
 
 Pevná adresa se hodí jen proto, abyste na její stránku trefili z notebooku;
 spojení navazuje vždycky ona směrem ven. Nastaví se buď rezervací v DHCP na

@@ -51,7 +51,10 @@ import urllib.request
 #: (rozhodnutí 21. 9. 2026). 1.15: opravy z auditu 23. 9. 2026 — escapování
 #: stránek, token celý jen pro tento počítač, hlídání pracovních vláken,
 #: atomický zápis nastavení, žádné příkazy na loopback, strop těla požadavku.
-VERSION = "1.16"
+#: 1.17: méně dotazů na server — přestávka mezi dotazy na příkazy v klidu,
+#: pomalejší opakování odložené dávky, delší trpělivost s pomalým serverem
+#: (`docs/SIT-A-ZATIZENI.md` v repozitáři Ri5).
+VERSION = "1.17"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -89,6 +92,13 @@ DEFAULT_SERVER = "https://bikody.com"
 #: delší, jinak by agent spojení trhal těsně před odpovědí.
 READ_TIMEOUT = 40.0
 
+#: Jak dlouho se čeká na potvrzení dávky průjezdů. Do 1.16 15 s — jenže
+#: o víkendu 3.–4. 10. 2026 server potvrzoval i za 17 s. Krabička to vzdala,
+#: poslala **tutéž dávku znovu**, a server pak dělal dvakrát stejnou práci
+#: přesně ve chvíli, kdy nestíhal. Spadlé spojení se pozná hned (RST,
+#: `_ZASTARALE`), na tenhle limit čeká jen spojení, které mlčí.
+PRUJEZDY_TIMEOUT_S = 20.0
+
 #: Po výpadku sítě se zkouší dál, jen pomaleji — u trati se běžně přepojuje
 #: kabel nebo přepíná wifi a agent to má přežít bez zásahu obsluhy.
 RECONNECT_MIN = 1.0
@@ -97,6 +107,29 @@ RECONNECT_MAX = 15.0
 #: Jak často se krabička ptá, jestli už ji někdo v aplikaci schválil. Obsluha
 #: mezitím opisuje token z displeje, takže ani rychleji, ani líně.
 APPROVAL_POLL_SECONDS = 5.0
+
+#: **Přestávka mezi dotazy na příkazy** (agent 1.17, výkonnostní průchod po
+#: BMX víkendu 3.–4. 10. 2026). Server drží dotaz nanejvýš vteřinu
+#: (`LONG_POLL_SECONDS` v cloudu) a krabička se do 1.16 ptala hned znovu:
+#: 27 897 dotazů za dva dny, každý drží jednoho workera serveru 1,1 s —
+#: přitom příkaz přijde v průměru jednou za ~16 s.
+#:
+#: Pravidla (čísla viz `docs/SIT-A-ZATIZENI.md` v repozitáři Ri5):
+#:
+#: * přišel příkaz před méně než `PRIKAZY_HORKO_S` → ptát se **hned**.
+#:   Pokrývá dávky příkazů (kontrolky dekodérů jdou jedna po druhé)
+#:   i záchranné stahování po 1,5 s, když push nedoručuje;
+#: * jinak `PRIKAZY_PAUZA_S` — o tolik se nejvýš prodlouží doručení
+#:   prvního příkazu. Nejtěsnější rozpočet má na serveru `tcp_exchange`
+#:   (1,5 s + 2 s), vteřina se do něj vejde i s pomalým dekodérem;
+#: * krabička bez proudu průjezdů a bez příkazu přes `PRIKAZY_KLID_PO_S`
+#:   (nikdo neměří ani nic nenastavuje) → `PRIKAZY_PAUZA_KLID_S`.
+#:
+#: Průjezdů se to netýká — ty jdou vlastním vláknem hned (`StreamLink`).
+PRIKAZY_HORKO_S = 3.0
+PRIKAZY_PAUZA_S = 1.0
+PRIKAZY_PAUZA_KLID_S = 2.0
+PRIKAZY_KLID_PO_S = 300.0
 
 
 def log(message: str) -> None:
@@ -235,8 +268,9 @@ class Server:
 
         **Veze s sebou stav push cesty.** Zpráva o tom, že proud nedoručuje,
         musí dojít právě tehdy, když nedoručuje — takže nesmí jet dávkou
-        průjezdů. Dlouhý dotaz jede každou vteřinu bez ohledu na provoz,
-        takže je to jediné místo, kde se cloud stav dozví vždycky.
+        průjezdů. Dlouhý dotaz jede bez ohledu na provoz (od 1.17 v klidu
+        jednou za ~2–3 s, viz `PRIKAZY_PAUZA_S`), takže je to jediné místo,
+        kde se cloud stav dozví vždycky.
 
         Starší server přijímá jen GET; když odmítne metodu, zeptáme se
         postaru a stav prostě nepošleme (krabička se kvůli hlášení
@@ -266,7 +300,7 @@ class Server:
         telo = {"decoder": decoder_id, "frames": frames, "receipt": True}
         if casy and len(casy) == len(frames):
             telo["frame_times"] = casy
-        return self._request("/passings/", telo, timeout=15.0)
+        return self._request("/passings/", telo, timeout=PRUJEZDY_TIMEOUT_S)
 
     def result(self, command_id: str, ok: bool, data: dict | None = None, error: str = "") -> None:
         self._request(
@@ -836,6 +870,20 @@ STREAM_EOR = 0x8F
 STREAM_MAX_FRAMES = 50
 STREAM_RETRY_INITIAL_SECONDS = 0.05
 STREAM_RETRY_SECONDS = 1.0
+#: Strop opakování, když server dávku **odložil** (`ok: false` s kódem jiným
+#: než `KOD_ZAHODIT`, typicky „krabička nemá přiřazený závod"). Server
+#: žije a odpověděl — dokud obsluha závod nepřiřadí, odpoví stejně. Do 1.16
+#: se ptal každou vteřinu za každou smyčku, klidně celé hodiny; pět vteřin
+#: po přiřazení závodu nikdo nepozná.
+STREAM_ODLOZENO_SECONDS = 5.0
+#: Jak dlouho odesílatel bez práce spí. Rámec ho budí hned (`_ready`), tohle
+#: je jen pojistka; do 1.16 vteřina = každou vteřinu tři dotazy do SQLite
+#: za smyčku úplně zbytečně.
+STREAM_IDLE_SECONDS = 5.0
+#: Takt čtení z dekodéru. Data `recv` vrátí hned, timeout jen určuje, jak
+#: často se smyčka podívá na zastavení a servis watchdogu (10 s). Do 1.16
+#: 0,1 s = deset probuzení za vteřinu na smyčku bez jediného bajtu.
+STREAM_RECV_TIMEOUT_SECONDS = 0.5
 
 #: Strop bufferu proudu — rámec má desítky bajtů; víc bez konce rámce je
 #: rozsypaný proud, ne data (stejná pojistka jako na serveru).
@@ -1158,10 +1206,11 @@ class StreamLink:
             self._ready.clear()
             try:
                 frames = pending.dalsi(STREAM_MAX_FRAMES)
-                self.stav["fronta"] = pending.ceka()
-                _zaznamenat_preliv(pending.ceka())
+                ceka = pending.ceka()
+                self.stav["fronta"] = ceka
+                _zaznamenat_preliv(ceka)
                 if not frames:
-                    self._ready.wait(1.0)
+                    self._ready.wait(STREAM_IDLE_SECONDS)
                     continue
                 started = time.monotonic()
                 answer = self.server.push_passings(decoder_id, frames, pending.casy())
@@ -1179,8 +1228,10 @@ class StreamLink:
                         log(f"Průjezdy {decoder_id[:8]}: server smyčku nezná, "
                             f"{len(frames)} rámců zahozeno (nepatří do závodu)")
                         continue
-                    self._stop.wait(min(retry_delay, STREAM_RETRY_SECONDS))
-                    retry_delay = min(retry_delay * 2, STREAM_RETRY_SECONDS)
+                    # Odložená dávka: server žije a řekl „teď ne". Zkouší se
+                    # dál, jen s delším stropem než po chybě spojení.
+                    self._stop.wait(min(retry_delay, STREAM_ODLOZENO_SECONDS))
+                    retry_delay = min(retry_delay * 2, STREAM_ODLOZENO_SECONDS)
                     continue
                 retry_delay = STREAM_RETRY_INITIAL_SECONDS
                 pending.potvrd()
@@ -1202,8 +1253,13 @@ class StreamLink:
                 log(f"Průjezdy {decoder_id[:8]}: {len(frames)} rámců, "
                     f"potvrzení serveru {elapsed:.0f} ms"
                     f"{' !' if elapsed > 200 else ''}")
-            except (OSError, ValueError, sqlite3.Error):
+            except (OSError, ValueError, sqlite3.Error) as exc:
                 # Včetně ztraceného ACK: nic se nemaže, duplicity řeší server.
+                if isinstance(exc, TimeoutError):
+                    # Server po `PRUJEZDY_TIMEOUT_S` neodpověděl — nejspíš
+                    # pořád pracuje. Tutéž dávku za 50 ms by dostal podruhé
+                    # do rozdělané práce; vteřina mu dá šanci doběhnout.
+                    retry_delay = STREAM_RETRY_SECONDS
                 self._stop.wait(min(retry_delay, STREAM_RETRY_SECONDS))
                 retry_delay = min(retry_delay * 2, STREAM_RETRY_SECONDS)
             except Exception as exc:  # noqa: BLE001
@@ -1219,7 +1275,7 @@ class StreamLink:
     def _pump(self, sock, pending, service, service_seconds) -> None:
         buffer = bytearray()
         last_service_at = time.monotonic()
-        sock.settimeout(0.1)
+        sock.settimeout(STREAM_RECV_TIMEOUT_SECONDS)
         while not self._stop.is_set():
             try:
                 chunk = sock.recv(8192)
@@ -1585,6 +1641,9 @@ class Worker:
         self.latest_sha256 = ""
         #: id smyčky -> běžící proud průjezdů (StreamLink)
         self._streams: dict[str, StreamLink] = {}
+        #: Kdy naposledy přišel příkaz (`time.monotonic`). Start se počítá
+        #: jako příkaz: po zapnutí krabičky obsluha typicky nastavuje.
+        self._posledni_prikaz = time.monotonic()
 
     # -- řízení ------------------------------------------------------------
 
@@ -1668,6 +1727,16 @@ class Worker:
             if callable(hlaseni):
                 _STAV_PROUDU[decoder_id] = hlaseni()
 
+    def pauza_pred_dotazem(self, ted: float | None = None) -> float:
+        """Kolik počkat, než se krabička zase zeptá na příkazy (viz `PRIKAZY_*`)."""
+        ted = time.monotonic() if ted is None else ted
+        ticho = ted - self._posledni_prikaz
+        if ticho < PRIKAZY_HORKO_S:
+            return 0.0
+        if not self._streams and ticho >= PRIKAZY_KLID_PO_S:
+            return PRIKAZY_PAUZA_KLID_S
+        return PRIKAZY_PAUZA_S
+
     def _run(self) -> None:
         backoff = RECONNECT_MIN
         greeted = False
@@ -1706,6 +1775,13 @@ class Worker:
                     log(f"Příkaz {command.get('action')} → {host}")
                     run_command(self.server, command)
                 backoff = RECONNECT_MIN
+                if commands:
+                    # Razítko až po vyřízení: výsledek odešel teprve teď
+                    # a navazující příkaz server vystaví až po něm.
+                    self._posledni_prikaz = time.monotonic()
+                pauza = self.pauza_pred_dotazem()
+                if pauza and self._stop.wait(pauza):
+                    break
             except urllib.error.HTTPError as exc:
                 if exc.code == 403:
                     # Token aplikace (zatím) nezná — přesně tenhle stav má
