@@ -34,6 +34,7 @@ import ipaddress
 import json
 import os
 import pathlib
+import re
 import socket
 import sqlite3
 import subprocess
@@ -1908,14 +1909,65 @@ def load_config() -> dict:
     return _precti_config(stara_config_path()) or {}
 
 
+#: Jméno počítače nebo IP adresa v adrese aplikace (IPv6 v hranatých závorkách).
+_HOSTNAME = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$")
+
+#: Adresa z nastavení, kterou agent odmítl — ukáže se na stránce nastavení.
+_odmitnuta_adresa: dict = {}
+
+
+def normalize_server(raw: str) -> str:
+    """Adresa aplikace ve tvaru `https://host[:port]`, nebo `""`, když to adresa není.
+
+    10. 10. 2026 na závodě stála krabička na WAITING, protože v nastavení byla
+    adresa `https://bikody.comSave Box token: … Copy it` — obsluha na dotykovém
+    displeji označila při kopírování i text za polem. Agent ji uložil bez
+    kontroly a pak se každých 15 s pokoušel číst port z „ … Copy it".
+    Adresa se proto ověřuje: jen http(s), platné jméno počítače, číselný port,
+    žádné mezery, cesta nanejvýš `/`.
+    """
+    text = (raw or "").strip()
+    if not text or any(znak.isspace() for znak in text):
+        return ""
+    if "://" not in text:
+        text = f"https://{text}"   # „bikody.com" napsané bez schématu
+    try:
+        cast = urllib.parse.urlsplit(text)
+        port = cast.port
+    except ValueError:
+        return ""
+    if cast.scheme not in ("http", "https") or not cast.hostname:
+        return ""
+    if cast.query or cast.fragment or cast.path not in ("", "/") or cast.username or cast.password:
+        return ""
+    host = cast.netloc.rsplit("@", 1)[-1]
+    jmeno = host.rsplit(":", 1)[0] if port is not None else host
+    if not _HOSTNAME.match(jmeno):
+        return ""
+    return f"{cast.scheme}://{host.lower()}"
+
+
 def configured_server(config: dict) -> str:
     """Adresa aplikace — z nastavení, jinak výchozí `DEFAULT_SERVER`.
 
     Prázdný řetězec v souboru znamená „nikdo nic nezadal", ne „nikam se
     nehlásit": krabička se staví pro jednu aplikaci a obsluha u trati nemá co
     opisovat adresu. Kdo chce vlastní server, přepíše ji v nastavení.
+
+    **Poškozená adresa se nepoužije** (10. 10. 2026): krabička, která ji má
+    uloženou z dřívějška, se místo nekonečného „server unavailable" ohlásí na
+    `DEFAULT_SERVER` a obsluha to uvidí na stránce nastavení.
     """
-    return (config.get("server") or "").strip() or DEFAULT_SERVER
+    ulozena = (config.get("server") or "").strip()
+    if not ulozena:
+        return DEFAULT_SERVER
+    adresa = normalize_server(ulozena)
+    if adresa:
+        return adresa
+    if _odmitnuta_adresa.get("adresa") != ulozena:
+        _odmitnuta_adresa["adresa"] = ulozena
+        log(f"Adresa aplikace v nastavení je neplatná, používám {DEFAULT_SERVER}.")
+    return DEFAULT_SERVER
 
 
 def save_config(server_url: str, token: str, *, autostart: bool = False) -> None:
@@ -3126,8 +3178,14 @@ def _render_settings(worker, config: dict, *, plny_token: bool = False) -> bytes
         "Download and stage the update</button></form>"
         if update_available else '<p class="hint ok">The agent is up to date.</p>'
     )
+    stav = str(worker.status if worker else "not started")
+    if _odmitnuta_adresa.get("adresa"):
+        stav = (
+            "Application address rejected (not a valid http(s) address): "
+            f"{_odmitnuta_adresa['adresa'][:80]!r} — using {configured_server(config)}. " + stav
+        )
     page = _SETTINGS.format(
-        stav=html.escape(str(worker.status if worker else "not started")),
+        stav=html.escape(stav),
         server=html.escape(configured_server(config)),
         autostart="checked" if config.get("autostart") else "",
         token=html.escape(_token_pro_klienta(config.get("token") or "—", plny_token)),
@@ -3385,7 +3443,15 @@ def build_web_server(state: dict, *, host: str, port: int):
                 self._send(b"", status=303, headers=[("Location", "/")])
                 return
 
-            server_url = (form.get("server", [""])[0] or "").strip() or configured_server(saved)
+            zadana = (form.get("server", [""])[0] or "").strip()
+            server_url = normalize_server(zadana) if zadana else configured_server(saved)
+            if not server_url:
+                # Neplatnou adresu neukládat — krabička zůstane na té, která jde.
+                _odmitnuta_adresa["adresa"] = zadana
+                log("Neplatná adresa aplikace v nastavení nebyla uložena.")
+                server_url = configured_server(saved)
+            else:
+                _odmitnuta_adresa.clear()
             autostart = "autostart" in form
 
             # Nový token se vyrábí jen na výslovné přání: obsluha ho má
@@ -3506,7 +3572,11 @@ def main(argv: list[str] | None = None) -> int:
         return uninstall_service()
 
     saved = load_config()
-    server_url = args.server or configured_server(saved)
+    server_url = configured_server(saved)
+    if args.server:
+        server_url = normalize_server(args.server)
+        if not server_url:
+            sys.exit(f"Neplatná adresa aplikace: {args.server!r} (čekám https://host[:port])")
     # Token si krabička vyrobí sama a ukáže ho na displeji; obsluha ho opíše
     # v aplikaci do Nastavení aplikace. Opačný směr by znamenal opisovat na
     # dotykovém displeji, což nikdo nechce.
