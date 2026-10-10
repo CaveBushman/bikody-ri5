@@ -1,7 +1,8 @@
 # Síťový provoz krabičky a zátěž serveru
 
-Výkonnostní průchod po BMX víkendu 3.–4. 10. 2026 (agent 1.17). Výchozí
-čísla jsou z nginx logu produkce za oba dny:
+Výkonnostní průchod po BMX víkendu 3.–4. 10. 2026 (agent 1.17). Tabulky
+níže zachycují tehdejší stav před prodloužením čekání v Cloudu; aktuální
+stav popisuje část „Cloud — čekání na příkazy“ na konci. Výchozí čísla jsou z nginx logu produkce za oba dny:
 
 | Adresa | Dotazů | Doba na serveru |
 |---|---|---|
@@ -79,11 +80,10 @@ zpoždění a ušetřilo málo.
 
 ## Co by pomohlo víc, ale není to na krabičce
 
-* **Delší držení dotazu na serveru** (např. 20–25 s) s probuzením napříč
-  workery — `LONG_POLL_SECONDS` je 1 s jen proto, že probuzení je
-  procesově lokální. Krabička delší držení unese už dnes (`READ_TIMEOUT`
-  40 s) a smlouva se nemění; dotazů by bylo ~3/min. Pauza krabičky pak
-  přidá nanejvýš vteřinu.
+* **Delší držení dotazu na serveru — již provedeno v Cloudu 6. 10. 2026:**
+  5 s s kontrolou sdílené cache po 0,2 s. Původní návrh 20–25 s se
+  nepoužil kvůli lhůtě ukončení procesu při nasazení a čerstvosti hlášení
+  krabičky. Podrobnosti jsou v aktuální části níže.
 * **Server řídí takt** (nepovinné pole v odpovědi `commands/`, např.
   „příští dotaz za N s“): server ví, jestli má někdo otevřenou obrazovku
   dekodérů. Změna smlouvy — neuděláno.
@@ -110,7 +110,31 @@ disku): 60 000 rámců po 128 znacích, medián pěti sérií po 2 000 voláníc
 Jde pouze o čtení počtu, ne o zrychlení celé cesty průjezdu; výsledek
 na Raspberry Pi a SD kartě je potřeba změřit zvlášť.
 
-Další doporučená práce podle dopadu: delší long polling s probuzením
-napříč cloudovými workery (viz výše), poté měření p95 ACK při reálném
-výpadku a obnově LTE na RI5. Pevné čekání na dávku nepřidávat: zhoršilo
-by dobu doručení čerstvého průjezdu.
+Další doporučená práce: měření p95 ACK při reálném výpadku a obnově LTE
+na RI5 a rozlišení času sítě, příjmu dávky a zpracování v Cloudu. Pevné
+čekání na dávku nepřidávat: zhoršilo by dobu doručení čerstvého průjezdu.
+
+## Cloud — čekání na příkazy (ověřeno 10. 10. 2026)
+
+Cloud již od 6. 10. drží prázdný dotaz **5 s**, před čekáním vrací spojení
+do databázového poolu a každých **0,2 s** čte ze sdílené cache stav práce.
+Lokální příkaz budí vlákno ihned, příkaz z jiného procesu při následující
+kontrole. Při klidu a sekundové pauze agenta vychází přibližně 10 dotazů
+za minutu (bez započítání síťové režie), v hlubokém klidu s pauzou 2 s
+přibližně 8,6. Jde o výpočet z časování, nikoli produkční měření.
+
+Navazující úprava 10. 10.:
+
+* Pořadí a kurzor fronty se čtou jedním `get_many` místo dvou `get`:
+  prázdný výběr stojí jedno čtení cache místo dvou, výběr dostupného
+  příkazu dvě čtení místo tří (včetně obsahu).
+* Lokální událost se registruje před prvním výběrem fronty. Příkaz,
+  který přijde do mezery mezi výběrem a čekáním, už neztratí probuzení;
+  při nedostupné cache by jinak čekal až do konce pětisekundové lhůty.
+* Pokud první kontrola sdílené cache už najde práci, odpoví se ihned,
+  bez zbytečného čekání dalších 0,2 s. Již nastavená lokální událost
+  nevyžaduje další čtení cache.
+
+Tato změna je pouze v Cloudu: nevyžaduje další verzi agenta ani změnu
+protokolu. Limit čekání se nemění; systemd dává na zastavení procesu 15 s
+a stav proudů i počítadla se přenáší spolu s příkazy.
