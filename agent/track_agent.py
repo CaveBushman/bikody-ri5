@@ -55,7 +55,9 @@ import urllib.request
 #: 1.17: méně dotazů na server — přestávka mezi dotazy na příkazy v klidu,
 #: pomalejší opakování odložené dávky, delší trpělivost s pomalým serverem
 #: (`docs/SIT-A-ZATIZENI.md` v repozitáři Ri5).
-VERSION = "1.17"
+#: 1.18: adresa aplikace se ověřuje — formulář neuloží nesmysl a poškozená
+#: uložená adresa se nepoužije (závod 10. 10. 2026, `normalize_server`).
+VERSION = "1.18"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
