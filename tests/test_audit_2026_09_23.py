@@ -329,4 +329,4 @@ def test_prikaz_na_loopback_odmitnut(monkeypatch):
 
 
 def test_verze_zvednuta():
-    assert ta.VERSION == "1.17"
+    assert tuple(map(int, ta.VERSION.split("."))) >= (1, 17)

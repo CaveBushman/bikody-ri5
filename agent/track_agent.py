@@ -57,7 +57,8 @@ import urllib.request
 #: (`docs/SIT-A-ZATIZENI.md` v repozitáři Ri5).
 #: 1.18: adresa aplikace se ověřuje — formulář neuloží nesmysl a poškozená
 #: uložená adresa se nepoužije (závod 10. 10. 2026, `normalize_server`).
-VERSION = "1.18"
+#: 1.19: velikost fronty v konstantním čase i po dlouhém výpadku sítě.
+VERSION = "1.19"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -1226,8 +1227,9 @@ class StreamLink:
                         # Držet dávku znamená jen odložit tutéž odpověď o dva
                         # dny — a pak ji přiznat jako ztrátu, kterou to není.
                         pending.potvrd()
-                        _zaznamenat_preliv(pending.ceka())
-                        self.stav["fronta"] = pending.ceka()
+                        ceka = pending.ceka()
+                        _zaznamenat_preliv(ceka)
+                        self.stav["fronta"] = ceka
                         log(f"Průjezdy {decoder_id[:8]}: server smyčku nezná, "
                             f"{len(frames)} rámců zahozeno (nepatří do závodu)")
                         continue
@@ -1239,11 +1241,12 @@ class StreamLink:
                 retry_delay = STREAM_RETRY_INITIAL_SECONDS
                 pending.potvrd()
                 _zaznamenat_prujezdy(int(answer.get("stored") or 0))
-                _zaznamenat_preliv(pending.ceka())
+                ceka = pending.ceka()
+                _zaznamenat_preliv(ceka)
                 elapsed = (time.monotonic() - started) * 1000
                 self.stav["ack_ms"] = round(elapsed)
                 self.stav["odeslano"] += len(frames)
-                self.stav["fronta"] = pending.ceka()
+                self.stav["fronta"] = ceka
                 # **Loguje se každá dávka, ne jen ta pomalá.** Do 1.13 se
                 # psal jen překročený rozpočet, takže z měřicí session byly
                 # v logu vidět **jenom výpadky** — medián ani percentil se
@@ -1388,13 +1391,30 @@ class FrameQueue:
                         "id INTEGER PRIMARY KEY AUTOINCREMENT, received REAL NOT NULL, "
                         "frame TEXT NOT NULL)")
         self.db.execute("CREATE INDEX IF NOT EXISTS frames_received ON frames(received)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS queue_size (id INTEGER PRIMARY KEY, bytes INTEGER NOT NULL)")
-        self.db.execute("INSERT OR IGNORE INTO queue_size SELECT 1, COALESCE(SUM(LENGTH(frame)), 0) FROM frames")
-        self.db.execute("CREATE TRIGGER IF NOT EXISTS frame_added AFTER INSERT ON frames "
-                        "BEGIN UPDATE queue_size SET bytes = bytes + LENGTH(NEW.frame) WHERE id = 1; END")
-        self.db.execute("CREATE TRIGGER IF NOT EXISTS frame_removed AFTER DELETE ON frames "
-                        "BEGIN UPDATE queue_size SET bytes = bytes - LENGTH(OLD.frame) WHERE id = 1; END")
-        self.db.commit()
+        # Počet i bajty se mění ve stejné transakci jako rámce. COUNT(*)
+        # na každém příjmu procházel celou frontu během výpadku sítě.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute("CREATE TABLE IF NOT EXISTS queue_size ("
+                            "id INTEGER PRIMARY KEY, bytes INTEGER NOT NULL)")
+            self.db.execute("INSERT OR IGNORE INTO queue_size "
+                            "SELECT 1, (SELECT COALESCE(SUM(LENGTH(frame)), 0) FROM frames) "
+                            "WHERE NOT EXISTS (SELECT 1 FROM queue_size WHERE id = 1)")
+            # Vlastní tabulka zachovává původní dvousloupcové queue_size:
+            # i agent 1.18 ji při návratu na starší verzi umí otevřít.
+            self.db.execute("CREATE TABLE IF NOT EXISTS queue_count ("
+                            "id INTEGER PRIMARY KEY, frames INTEGER NOT NULL)")
+            initialized = self.db.execute("SELECT 1 FROM queue_count WHERE id = 1").fetchone()
+            if not initialized:
+                self.db.execute("INSERT INTO queue_count SELECT 1, COUNT(*) FROM frames")
+                self.db.execute("DROP TRIGGER IF EXISTS frame_added")
+                self.db.execute("DROP TRIGGER IF EXISTS frame_removed")
+            self.db.execute("CREATE TRIGGER IF NOT EXISTS frame_added AFTER INSERT ON frames "
+                            "BEGIN UPDATE queue_size SET bytes = bytes + LENGTH(NEW.frame) WHERE id = 1; "
+                            "UPDATE queue_count SET frames = frames + 1 WHERE id = 1; END")
+            self.db.execute("CREATE TRIGGER IF NOT EXISTS frame_removed AFTER DELETE ON frames "
+                            "BEGIN UPDATE queue_size SET bytes = bytes - LENGTH(OLD.frame) WHERE id = 1; "
+                            "UPDATE queue_count SET frames = frames - 1 WHERE id = 1; END")
         self._offered = []
 
     def __enter__(self):
@@ -1422,7 +1442,7 @@ class FrameQueue:
 
     def ceka(self):
         with self._lock:
-            return self.db.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
+            return self.db.execute("SELECT frames FROM queue_count WHERE id = 1").fetchone()[0]
 
     def dalsi(self, limit):
         with self._lock:

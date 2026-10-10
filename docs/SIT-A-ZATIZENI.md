@@ -89,3 +89,28 @@ zpoždění a ušetřilo málo.
   dekodérů. Změna smlouvy — neuděláno.
 * **Jedna dávka pro víc smyček** (Hill + Finish v jednom POSTu) by
   zhruba půlila `passings/`. Změna smlouvy — neuděláno.
+
+## Agent 1.19 — fronta při výpadku (10. 10. 2026)
+
+`FrameQueue.ceka()` se volá při příjmu i opakovaně při odeslání. Původní
+`COUNT(*)` musí načítat stránky celé tabulky nebo indexu; s narůstající
+frontou roste režie pod zámkem sdíleným s přijímačem. Nově počet udržují
+SQLite triggery v samostatném řádku `queue_count`, ve stejné transakci
+jako rámce. Čtení je konstantní. Po ACK se stav načte jednou pro displej
+i diagnostiku. Při opětovném otevření se už ani nepřepočítává součet bajtů.
+
+Existující fronta dostane počítadlo při prvním otevření v jedné transakci.
+Původní `queue_size` zachovává schéma, takže frontu umí otevřít i agent
+1.18; jeho zápisy dál udržují nové počítadlo přes triggery. Limity, WAL,
+mazání až po ACK a okamžité odesílání průjezdů zůstávají stejné.
+
+Lokální mikrobenchmark (macOS, Python 3.14, dočasná SQLite na lokálním
+disku): 60 000 rámců po 128 znacích, medián pěti sérií po 2 000 voláních
+`ceka()`: agent 1.18 **14,30 µs**, agent 1.19 **2,27 µs** (asi **6,3×**).
+Jde pouze o čtení počtu, ne o zrychlení celé cesty průjezdu; výsledek
+na Raspberry Pi a SD kartě je potřeba změřit zvlášť.
+
+Další doporučená práce podle dopadu: delší long polling s probuzením
+napříč cloudovými workery (viz výše), poté měření p95 ACK při reálném
+výpadku a obnově LTE na RI5. Pevné čekání na dávku nepřidávat: zhoršilo
+by dobu doručení čerstvého průjezdu.
