@@ -138,3 +138,60 @@ Navazující úprava 10. 10.:
 Tato změna je pouze v Cloudu: nevyžaduje další verzi agenta ani změnu
 protokolu. Limit čekání se nemění; systemd dává na zastavení procesu 15 s
 a stav proudů i počítadla se přenáší spolu s příkazy.
+
+## Opakovatelné měření na RI5 (11. 10. 2026)
+
+Nástroj `scripts/measure-performance.py` používá jen standardní knihovnu
+Pythonu. Spouštějte z kořene aktuálního checkoutu BIKODY Ri5.
+
+### Počítání fronty na konkrétním disku
+
+```bash
+python3 scripts/measure-performance.py queue --directory .
+```
+
+Vytvoří vlastní dočasný adresář na zvoleném svazku, naplní zkušební frontu
+60 000 rámci po 128 znacích a porovná původní `COUNT(*)` s udržovaným
+počítadlem. Výstup JSON uvádí medián pěti sérií po 2 000 čteních, verzi
+agenta, Pythonu a platformu. Pořadí metod střídá a po sobě databázi smaže.
+Živou frontu neotevírá, nevolá Cloud a nerestartuje služby.
+
+`--directory` zvolte na stejné SD kartě jako data agenta, s právem zápisu;
+výchozí systémový dočasný adresář může být na Linuxu v RAM. Jde o zahřáté
+čtení SQLite, nikoli test zápisu, odolnosti SD nebo celé cesty průjezdu.
+Měření samo krátce zatíží CPU a disk, proto ho provádějte mimo měřenou jízdu.
+
+Lokální ověření 11. 10. na macOS arm64 / Python 3.14.6: **12,39 → 2,32 µs**
+na čtení, přibližně **5,3×**. Fyzické RI5 nebylo připojeno; jeho výsledek
+z tohoto čísla nelze odvodit.
+
+### Potvrzení skutečných dávek z logu
+
+```bash
+journalctl -u bikody-agent --since '1 hour ago' --no-pager -o cat > ri5-agent.log
+python3 scripts/measure-performance.py ack ri5-agent.log
+```
+
+Log musí být přístupný uživateli spouštějícímu `journalctl`; podle nastavení
+krabičky může být nutné spustit tento příkaz přes `sudo`. Lze číst i stdin:
+
+```bash
+journalctl -u bikody-agent --since '1 hour ago' --no-pager -o cat \
+  | python3 scripts/measure-performance.py ack
+```
+
+JSON obsahuje počet úspěšných dávek a rámců, medián, p95, p99, maximum
+a počet potvrzení přes 200 ms, souhrnně i podle identifikátoru dekodéru
+z logu. Percentily jsou podle dávek metodou nearest rank, ne vážené
+počtem rámců. Různé velikosti dávek a různá období proto porovnávejte
+s uvedením počtu vzorků.
+
+ACK je čas od zahájení odeslání dávky do potvrzení a místního zpracování
+ACK. Nezahrnuje čekání rámce před odesláním; neúspěšné pokusy a ztracená
+potvrzení v této statistice nejsou. Nelze z ní určit jednosměrnou latenci
+ani ztrátovost. Prázdný log nebo log bez úspěšných dávek končí chybou
+s návratovým kódem 2, nikdy tvrzením o nulové latenci.
+
+Testy nástroje ověřují percentily, oddělení neúspěšných hlášení, odmítnutí
+chybějících dat a neplatných parametrů i zachování cizí databáze vedle
+zkušebního adresáře. Fyzické měření zbývá po připojení RI5.
