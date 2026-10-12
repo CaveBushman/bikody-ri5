@@ -58,7 +58,7 @@ import urllib.request
 #: 1.18: adresa aplikace se ověřuje — formulář neuloží nesmysl a poškozená
 #: uložená adresa se nepoužije (závod 10. 10. 2026, `normalize_server`).
 #: 1.19: velikost fronty v konstantním čase i po dlouhém výpadku sítě.
-VERSION = "1.20"
+VERSION = "1.21"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -270,7 +270,11 @@ class Server:
         `{"paired": true}`, když už krabičku zná. Cloud bez párování
         (do 12. 10. 2026) odpoví 404 a krabička ukáže celý token jako dřív.
         """
-        return self._request("/pair/", {"hostname": socket.gethostname()}, timeout=15.0)
+        # Mimo `_request` schválně: 404 tady znamená „cloud párování neumí",
+        # ne „cloud nezná kanonickou adresu" — a `_request` by si po 404
+        # natrvalo přepnul **všechen** provoz na starou cestu.
+        cesta = CESTA_STARA if self._stara_cesta else CESTA
+        return self._odesli(cesta + "/pair/", {"hostname": socket.gethostname()}, timeout=15.0)
 
     def commands(self) -> list[dict]:
         answer = self.poll()
@@ -1672,6 +1676,8 @@ class Worker:
         #: Pětiznakový kód z `Server.pair`, který obsluha opíše do aplikace.
         #: Prázdný = krabička je spárovaná, nebo cloud párování neumí.
         self.parovaci_kod = ""
+        #: Do kdy kód platí (`time.monotonic`); prošlý se na displeji neukáže.
+        self.parovaci_kod_do = 0.0
         self.latest_version = VERSION
         self.latest_sha256 = ""
         #: id smyčky -> běžící proud průjezdů (StreamLink)
@@ -1736,7 +1742,19 @@ class Worker:
         if kod and kod != self.parovaci_kod:
             log("Párovací kód krabičky obnoven.")
         self.parovaci_kod = kod
+        try:
+            platnost = float(odpoved.get("expires_in") or 0)
+        except (TypeError, ValueError):
+            platnost = 0.0
+        self.parovaci_kod_do = time.monotonic() + platnost
         return False
+
+    def platny_kod(self) -> str:
+        """Kód pro displej — jen dokud platí. Prošlý by obsluha opsala marně
+        a každý marný pokus ubírá klubu z limitu pokusů."""
+        if self.parovaci_kod and time.monotonic() < self.parovaci_kod_do:
+            return self.parovaci_kod
+        return ""
 
     def _set(self, text: str, *, connected: bool) -> None:
         self.status = text
@@ -2966,7 +2984,8 @@ def _screen_state(worker, config: dict) -> dict:
     # Červeně, ne žlutě: ČEKÁ znamená „ještě to nejede" a od zeleného OK se
     # musí lišit na první pohled i přes půlku závodiště. Žlutá zůstává
     # výjimečnému NASTAVIT.
-    kod = str(getattr(worker, "parovaci_kod", "") or "")
+    platny = getattr(worker, "platny_kod", None)
+    kod = platny() if callable(platny) else ""
     if kod:
         # Párovací kód místo tokenu (12. 10. 2026): pět znaků se opisuje
         # snáz než šest čtveřic a token sám nikam opisovat netřeba.

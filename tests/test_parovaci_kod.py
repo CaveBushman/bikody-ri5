@@ -51,6 +51,35 @@ def test_cloud_bez_parovani_ukaze_cely_token():
     assert stav["token"] == TOKEN, "starý cloud kód nevydá — opisuje se token jako dřív"
 
 
+def test_prosly_kod_se_neukaze(monkeypatch):
+    """Výpadek spojení: kód, který vypršel, na displeji nesmí zůstat."""
+    worker = _worker({"code": "K7RQ4", "expires_in": 600})
+    worker._vyzadej_kod()
+    worker.parovaci_kod_do = 0.0
+
+    stav = ta._screen_state(worker, {"server": "http://192.168.9.1", "token": TOKEN})
+
+    assert stav["token"] == TOKEN
+
+
+def test_404_z_parovani_neprepne_provoz_na_starou_cestu(monkeypatch):
+    server = ta.Server("http://192.168.9.1", TOKEN)
+    cesty = []
+
+    def odesli(path, payload=None, *, timeout):
+        cesty.append(path)
+        raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(server, "_odesli", odesli)
+    try:
+        server.pair()
+    except urllib.error.HTTPError:
+        pass
+
+    assert cesty == [ta.CESTA + "/pair/"]
+    assert server._stara_cesta is False
+
+
 def test_kod_se_do_site_neprozradi():
     """Kdo kód z LAN opíše dřív než obsluha, odnese si krabičku."""
     assert ta._token_pro_klienta("K7RQ4", False) == "•••••"
