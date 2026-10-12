@@ -69,9 +69,12 @@ a stav se dá otevřít z notebooku v síti.
    ke spuštění (scp, rozbalený archiv, klon s vypnutým `core.fileMode`) a
    `sudo ./deploy.sh` pak hlásí „command not found". Přes `bash` to jde vždy;
    kdo chce, může si právo vrátit: `chmod +x deploy.sh`.*
-3. Na displeji se ukáže **token krabičky** — šest čtveřic na dvou řádcích. Opište ho
+3. Na displeji se ukáže **párovací kód** — pět znaků (např. `K7RQ4`). Opište ho
    v aplikaci do *Nastavení aplikace* → **Přihlásit krabičku**. To je jediný
-   krok, který po instalaci zbývá.
+   krok, který po instalaci zbývá. Kód platí deset minut a pak ho krabička
+   sama vymění; token krabičky (šest čtveřic) zůstává dlouhý a nikam se
+   neopisuje. Se starším cloudem bez párování ukáže displej celý token jako
+   dřív.
 4. Do pěti vteřin naskočí na displeji velké zelené **OK**.
 
 Co skript umí navíc:

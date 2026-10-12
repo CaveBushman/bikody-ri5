@@ -58,7 +58,7 @@ import urllib.request
 #: 1.18: adresa aplikace se ověřuje — formulář neuloží nesmysl a poškozená
 #: uložená adresa se nepoužije (závod 10. 10. 2026, `normalize_server`).
 #: 1.19: velikost fronty v konstantním čase i po dlouhém výpadku sítě.
-VERSION = "1.19"
+VERSION = "1.20"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -262,6 +262,15 @@ class Server:
              "protocol": PROTOKOL, "dropped_frames": zahozeno},
             timeout=15.0,
         )
+
+    def pair(self) -> dict:
+        """Párovací kód na displej, dokud krabičku žádný klub nepřijal.
+
+        Server vrací `{"code": "K7RQ4", "expires_in": 600}`, nebo
+        `{"paired": true}`, když už krabičku zná. Cloud bez párování
+        (do 12. 10. 2026) odpoví 404 a krabička ukáže celý token jako dřív.
+        """
+        return self._request("/pair/", {"hostname": socket.gethostname()}, timeout=15.0)
 
     def commands(self) -> list[dict]:
         answer = self.poll()
@@ -1660,6 +1669,9 @@ class Worker:
         self._thread: threading.Thread | None = None
         self.connected = False
         self.status = "not started"
+        #: Pětiznakový kód z `Server.pair`, který obsluha opíše do aplikace.
+        #: Prázdný = krabička je spárovaná, nebo cloud párování neumí.
+        self.parovaci_kod = ""
         self.latest_version = VERSION
         self.latest_sha256 = ""
         #: id smyčky -> běžící proud průjezdů (StreamLink)
@@ -1699,6 +1711,32 @@ class Worker:
                     and not self._stop.is_set())
 
     # -- vnitřek -----------------------------------------------------------
+
+    def _vyzadej_kod(self) -> bool:
+        """Obnoví párovací kód. `True` = server krabičku mezitím přijal.
+
+        Opisuje se pětiznakový kód, ne token (David 12. 10. 2026). Token
+        zůstává dlouhý, protože je to heslo do klubové sítě; kód platí jen
+        pár minut a jen pro tuhle čekající krabičku. Když párování nejde
+        (starý cloud, výpadek), kód zmizí a displej ukáže celý token.
+        """
+        try:
+            odpoved = self.server.pair()
+        except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+            if self.parovaci_kod:
+                log(f"Párovací kód se nepodařilo obnovit: {exc}")
+            self.parovaci_kod = ""
+            return False
+        if not isinstance(odpoved, dict):
+            self.parovaci_kod = ""
+            return False
+        if odpoved.get("paired"):
+            return True
+        kod = normalize_token(str(odpoved.get("code") or ""))
+        if kod and kod != self.parovaci_kod:
+            log("Párovací kód krabičky obnoven.")
+        self.parovaci_kod = kod
+        return False
 
     def _set(self, text: str, *, connected: bool) -> None:
         self.status = text
@@ -1774,6 +1812,7 @@ class Worker:
                     self.latest_sha256 = str(hello.get("agent_sha256") or "")
                     name = hello.get("agent")
                     organization = hello.get("organization")
+                    self.parovaci_kod = ""
                     self._set(f"connected as {name} ({organization})", connected=True)
 
                 answer = self.server.poll()
@@ -1811,6 +1850,8 @@ class Worker:
                     # krabička po zapnutí, než ho někdo opíše do Nastavení
                     # dekodérů. Není to chyba, je to čekání.
                     greeted = False
+                    if self._vyzadej_kod():
+                        continue
                     self._set("waiting for approval in the app", connected=False)
                     self._stop.wait(APPROVAL_POLL_SECONDS)
                     continue
@@ -2293,6 +2334,9 @@ def maskuj_token(token: str) -> str:
     token = (token or "").strip()
     if not token or token == "—":
         return token or "—"
+    if "-" not in token:
+        # Párovací kód má pět znaků; první „skupina" by z něj prozradila čtyři.
+        return "•" * len(token)
     prvni = token.split("-", 1)[0][:TOKEN_GROUP_LEN]
     return f"{prvni}-••••"
 
@@ -2922,6 +2966,17 @@ def _screen_state(worker, config: dict) -> dict:
     # Červeně, ne žlutě: ČEKÁ znamená „ještě to nejede" a od zeleného OK se
     # musí lišit na první pohled i přes půlku závodiště. Žlutá zůstává
     # výjimečnému NASTAVIT.
+    kod = str(getattr(worker, "parovaci_kod", "") or "")
+    if kod:
+        # Párovací kód místo tokenu (12. 10. 2026): pět znaků se opisuje
+        # snáz než šest čtveřic a token sám nikam opisovat netřeba.
+        return {
+            "barva": "#ef4444", "zare": "rgba(239,68,68,.35)",
+            "znak": "…", "slovo": "WAITING",
+            "detail": worker.status,
+            "token_popisek": "Enter this code in the app:",
+            "token": kod,
+        }
     return {
         "barva": "#ef4444", "zare": "rgba(239,68,68,.35)",
         "znak": "…", "slovo": "WAITING",
