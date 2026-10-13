@@ -58,7 +58,7 @@ import urllib.request
 #: 1.18: adresa aplikace se ověřuje — formulář neuloží nesmysl a poškozená
 #: uložená adresa se nepoužije (závod 10. 10. 2026, `normalize_server`).
 #: 1.19: velikost fronty v konstantním čase i po dlouhém výpadku sítě.
-VERSION = "1.21"
+VERSION = "1.22"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -1874,7 +1874,15 @@ class Worker:
                     self._stop.wait(APPROVAL_POLL_SECONDS)
                     continue
                 greeted = False
-                self._set(f"server answered {exc.code}, retrying", connected=False)
+                # Server říká proč (`detail`) — např. 426 „umím protokol 1–2"
+                # u novějšího agenta proti staršímu serveru. Do 1.22 se to
+                # nikde neukázalo, jen „server answered 426, retrying"
+                # (kontrola spolupráce systémů 13. 10. 2026).
+                duvod = _detail_chyby(exc)
+                self._set(
+                    f"server answered {exc.code}" + (f": {duvod}" if duvod else "") + ", retrying",
+                    connected=False,
+                )
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, RECONNECT_MAX)
             except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
@@ -3259,6 +3267,17 @@ def _service_hint() -> str:
     )
 
 
+def _detail_chyby(exc) -> str:
+    """Věta `detail` (nebo `error`) z JSON těla chybové odpovědi serveru."""
+    try:
+        telo = json.loads(exc.read() or b"{}")
+    except Exception:  # noqa: BLE001 — tělo nemusí být JSON (nginx 502)
+        return ""
+    if not isinstance(telo, dict):
+        return ""
+    return str(telo.get("detail") or telo.get("error") or "")[:200]
+
+
 def _render_settings(worker, config: dict, *, plny_token: bool = False) -> bytes:
     """Stránka nastavení. **Každá vložená hodnota se escapuje.**
 
@@ -3486,7 +3505,10 @@ def build_web_server(state: dict, *, host: str, port: int):
                         ok, chyba = zkus_kameru(host, port)
                         _uloz_stav_kamery(ok=ok, chyba=chyba)
                 except urllib.error.HTTPError as exc:
-                    _uloz_stav_kamery(zprava=f"The app refused it (HTTP {exc.code}).")
+                    duvod = _detail_chyby(exc)
+                    _uloz_stav_kamery(
+                        zprava=f"The app refused it (HTTP {exc.code})" + (f": {duvod}" if duvod else ".")
+                    )
                 except (OSError, ValueError) as exc:
                     _uloz_stav_kamery(zprava=f"Failed: {exc}")
                 self._send(b"", status=303, headers=[("Location", "/nastaveni")])
