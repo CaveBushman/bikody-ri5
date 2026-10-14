@@ -58,7 +58,7 @@ import urllib.request
 #: 1.18: adresa aplikace se ověřuje — formulář neuloží nesmysl a poškozená
 #: uložená adresa se nepoužije (závod 10. 10. 2026, `normalize_server`).
 #: 1.19: velikost fronty v konstantním čase i po dlouhém výpadku sítě.
-VERSION = "1.22"
+VERSION = "1.23"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -302,7 +302,7 @@ class Server:
             return self._request("/commands/", timeout=READ_TIMEOUT)
 
     def push_passings(self, decoder_id: str, frames: list[str],
-                      casy: list[int] | None = None) -> dict:
+                      casy: list[int] | None = None, event: str = "") -> dict:
         """Pošle rámce průjezdů hned, jak je dekodér vydal (base64).
 
         `casy` jsou unixové časy v **milisekundách**, kdy krabička ten rámec
@@ -315,6 +315,10 @@ class Server:
         se starou krabičkou poradí, jen rozklad neukáže.
         """
         telo = {"decoder": decoder_id, "frames": frames, "receipt": True}
+        if event:
+            # Závod, ke kterému fronta patří (konfigurace proudu, 1.23). Server
+            # dávku jiného závodu odmítne a krabička si ji nechá.
+            telo["event"] = event
         if casy and len(casy) == len(frames):
             telo["frame_times"] = casy
         return self._request("/passings/", telo, timeout=PRUJEZDY_TIMEOUT_S)
@@ -1155,7 +1159,7 @@ class StreamLink:
         """
         if self._stop.is_set():
             return False
-        for key in ("decoder", "host", "port", "service", "service_seconds"):
+        for key in ("decoder", "host", "port", "service", "service_seconds", "event"):
             if self.config.get(key) != config.get(key):
                 return False
         return True
@@ -1176,7 +1180,13 @@ class StreamLink:
 
         # Jediný odesílatel žije přes reconnecty dekodéru. Historie tak
         # doletí i tehdy, když dekodér mlčí nebo je odpojený.
-        with FrameQueue(preliv_path(decoder_id).with_suffix(".sqlite3")) as pending:
+        event = str(self.config.get("event") or "")
+        self.fronta_cesta = str(preliv_path(decoder_id, event).with_suffix(".sqlite3"))
+        with FrameQueue(pathlib.Path(self.fronta_cesta)) as pending:
+            if event:
+                # Fronta z doby před závodem v názvu patří k závodu, který
+                # smyčka jede teď — tak se s ní zacházelo vždycky.
+                _prevezmi_starou_frontu(preliv_path(decoder_id).with_suffix(".sqlite3"), pending)
             legacy = Preliv(preliv_path(decoder_id))
             while legacy.ceka():
                 frames = legacy.dalsi(STREAM_MAX_FRAMES)
@@ -1230,7 +1240,11 @@ class StreamLink:
                     self._ready.wait(STREAM_IDLE_SECONDS)
                     continue
                 started = time.monotonic()
-                answer = self.server.push_passings(decoder_id, frames, pending.casy())
+                zavod = str(self.config.get("event") or "")
+                answer = (
+                    self.server.push_passings(decoder_id, frames, pending.casy(), event=zavod)
+                    if zavod else self.server.push_passings(decoder_id, frames, pending.casy())
+                )
                 if not isinstance(answer, dict):
                     raise ValueError("the server answer is not an object")
                 if not answer.get("ok"):
@@ -1648,14 +1662,67 @@ class Preliv:
                 pass
 
 
-def preliv_path(decoder_id: str) -> pathlib.Path:
+def preliv_path(decoder_id: str, event: str = "") -> pathlib.Path:
     """Soubor přelivu pro jednu smyčku — vedle nastavení, ne v /tmp.
 
     Vedle nastavení proto, že přeliv musí přežít restart krabičky: výpadek
     sítě a restart jdou v praxi spolu (někdo přepojuje switch).
+
+    **Pro každý závod zvlášť** (`event`, 1.23 — kontrola spolupráce systémů
+    13. 10. 2026). Fronta smyčky, která z konfigurace zmizela, do té doby
+    čekala na disku a odešla, až se tatáž smyčka objevila u **jiného** závodu
+    — server ji zapsal do závodu, který měl token zrovna přiřazený. Teď má
+    každý závod vlastní soubor; fronta starého závodu zůstane odložená a
+    displej ji ukáže (`_odlozene_fronty`).
     """
     jmeno = "".join(z for z in decoder_id if z.isalnum() or z in "-_")[:36]
-    return config_path().with_name(f"preliv-{jmeno or 'smycka'}.txt")
+    zavod = "".join(z for z in event if z.isalnum() or z in "-_")[:36]
+    return config_path().with_name(
+        f"preliv-{jmeno or 'smycka'}" + (f"--{zavod}" if zavod else "") + ".txt")
+
+
+def _prevezmi_starou_frontu(stara: pathlib.Path, nova) -> None:
+    """Přesune rámce z fronty bez závodu (≤1.22) do fronty závodu."""
+    if not stara.exists():
+        return
+    try:
+        with FrameQueue(stara) as zdroj:
+            while True:
+                ramce = zdroj.dalsi(STREAM_MAX_FRAMES)
+                if not ramce:
+                    break
+                prijato = [ms / 1000 for ms in zdroj.casy()]
+                if nova.pridej(ramce, received=prijato):
+                    return  # plná fronta: zbytek zůstane, zkusí se po restartu
+                zdroj.potvrd()
+        stara.unlink(missing_ok=True)
+    except (OSError, sqlite3.Error) as exc:
+        log(f"Starou frontu {stara.name} se nepodařilo převzít: {exc}")
+
+
+_ODLOZENE: dict = {"kdy": 0.0, "pocet": 0}
+
+
+def _odlozene_fronty(aktivni: set) -> int:
+    """Kolik rámců leží ve frontách závodů, které teď nikdo neposílá.
+
+    `aktivni` jsou cesty front běžících proudů. Počítá se jednou za deset
+    vteřin — displej se ptá každou vteřinu a souborů je pár.
+    """
+    ted = time.monotonic()
+    if ted - _ODLOZENE["kdy"] < 10:
+        return _ODLOZENE["pocet"]
+    pocet = 0
+    for cesta in config_path().parent.glob("preliv-*--*.sqlite3"):
+        if str(cesta) in aktivni:
+            continue
+        try:
+            with sqlite3.connect(f"file:{cesta}?mode=ro", uri=True) as db:
+                pocet += db.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
+        except sqlite3.Error:
+            continue
+    _ODLOZENE.update(kdy=ted, pocet=pocet)
+    return pocet
 
 
 
@@ -2643,6 +2710,12 @@ _SCREEN = """<!doctype html>
  <!-- Přeliv: rámce leží na disku a čekají, až server začne brát. Obsluha
       nemá nikam běžet — tohle je informace „nic se neztratilo", ne úkol.
       Proto oranžově a s větou o tom, že to doletí samo. -->
+ <!-- Fronta závodu, který se už neměří (1.23): do jiného závodu se nepošle.
+      Oranžově jako přeliv — nic se neztratilo; průjezdy jsou i v dekodéru. -->
+ <div id="odlozeno-pruh" class="preliv" hidden>
+  &#9208;&nbsp;<strong id="odlozeno-pocet">0</strong> FRAMES OF A PREVIOUS EVENT KEPT ON DISK —
+  NOT SENT TO THIS EVENT. RE-READ THEM FROM THE DECODER IN THE APP IF NEEDED
+ </div>
  <div id="preliv-pruh" class="preliv" hidden>
   &#8987;&nbsp;<strong id="preliv-pocet">0</strong> FRAMES WAITING ON DISK —
   THEY GO OUT BY THEMSELVES ONCE THE SERVER ANSWERS
@@ -2721,6 +2794,14 @@ _SCREEN = """<!doctype html>
     }}
     // Přeliv naopak **je** dočasný: až se server ozve, číslo padá k nule
     // a pruh zmizí. Že mizí sám, je ta informace.
+    var odlozeno = Number(data.odlozeno || 0);
+    var odlozenoPruh = document.getElementById("odlozeno-pruh");
+    if (odlozenoPruh) {{
+      odlozenoPruh.hidden = odlozeno <= 0;
+      if (odlozeno > 0) {{
+        document.getElementById("odlozeno-pocet").textContent = String(odlozeno);
+      }}
+    }}
     var preliv = Number(data.preliv || 0);
     var prelivPruh = document.getElementById("preliv-pruh");
     prelivPruh.hidden = preliv <= 0;
@@ -3191,6 +3272,12 @@ def _stav_json(worker, config: dict, *, plny_token: bool = False) -> bytes:
             "celkem": prujezdy["celkem"],
             "posledni": prujezdy["naposledy"],
             "preliv": prujezdy["preliv"],
+            # Rámce závodu, který se už neměří (1.23): leží na disku, do
+            # jiného závodu nejdou.
+            "odlozeno": _odlozene_fronty({
+                getattr(link, "fronta_cesta", "")
+                for link in (getattr(worker, "_streams", {}) or {}).values()
+            }) if worker else 0,
             "zahozeno": prujezdy["zahozeno"],
             "zahozeno_kdy": prujezdy["zahozeno_kdy"],
             "odjisteno": _novy_token_odjisten(),
