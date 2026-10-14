@@ -30,6 +30,7 @@ import base64
 import hashlib
 import html
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -58,7 +59,7 @@ import urllib.request
 #: 1.18: adresa aplikace se ověřuje — formulář neuloží nesmysl a poškozená
 #: uložená adresa se nepoužije (závod 10. 10. 2026, `normalize_server`).
 #: 1.19: velikost fronty v konstantním čase i po dlouhém výpadku sítě.
-VERSION = "1.23"
+VERSION = "1.24"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -113,7 +114,7 @@ RECONNECT_MAX = 15.0
 APPROVAL_POLL_SECONDS = 5.0
 
 #: **Přestávka mezi dotazy na příkazy** (agent 1.17, výkonnostní průchod po
-#: BMX víkendu 3.–4. 10. 2026). Server drží dotaz nanejvýš vteřinu
+#: BMX víkendu 3.–4. 10. 2026). Server drží dotaz až 5 s
 #: (`LONG_POLL_SECONDS` v cloudu) a krabička se do 1.16 ptala hned znovu:
 #: 27 897 dotazů za dva dny, každý drží jednoho workera serveru 1,1 s —
 #: přitom příkaz přijde v průměru jednou za ~16 s.
@@ -234,8 +235,12 @@ class Server:
                 if odpoved.will_close:
                     self._zahod(klic)
                 if odpoved.status >= 400:
+                    # Tělo jde s výjimkou: `_detail_chyby` z něj čte větu
+                    # serveru (426 „nasaďte cloud", 400 u kamery). Do 1.23
+                    # tu stálo `None` a věta se neukázala nikdy (kontrola
+                    # spolupráce systémů 14. 10. 2026).
                     raise urllib.error.HTTPError(url, odpoved.status, odpoved.reason,
-                                                 odpoved.headers, None)
+                                                 odpoved.headers, io.BytesIO(telo))
                 return json.loads(telo or b"{}")
             except self._ZASTARALE as exc:
                 self._zahod(klic)
@@ -3354,6 +3359,17 @@ def _service_hint() -> str:
     )
 
 
+def _verze(text: str) -> tuple[int, ...]:
+    """`"1.24"` → `(1, 24)` — porovnávat číselně, ne jako text."""
+    casti = []
+    for kus in str(text).split("."):
+        try:
+            casti.append(int(kus))
+        except ValueError:
+            casti.append(0)
+    return tuple(casti)
+
+
 def _detail_chyby(exc) -> str:
     """Věta `detail` (nebo `error`) z JSON těla chybové odpovědi serveru."""
     try:
@@ -3374,7 +3390,9 @@ def _render_settings(worker, config: dict, *, plny_token: bool = False) -> bytes
     od serveru a tabulka spojení.
     """
     latest = getattr(worker, "latest_version", VERSION) if worker else VERSION
-    update_available = latest and latest != VERSION
+    # Jen novější: krabička novější než cloud (nasazená dřív) by jinak dostala
+    # nabídku „aktualizace", která ji vrátí na starší verzi (1.24).
+    update_available = bool(latest) and _verze(latest) > _verze(VERSION)
     update_button = (
         '<form method="post" action="/aktualizovat"><button type="submit">'
         "Download and stage the update</button></form>"
