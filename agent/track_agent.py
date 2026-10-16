@@ -59,7 +59,7 @@ import urllib.request
 #: 1.18: adresa aplikace se ověřuje — formulář neuloží nesmysl a poškozená
 #: uložená adresa se nepoužije (závod 10. 10. 2026, `normalize_server`).
 #: 1.19: velikost fronty v konstantním čase i po dlouhém výpadku sítě.
-VERSION = "1.24"
+VERSION = "1.25"
 
 #: Kód, kterým server říká, že dávka **nikam nepatří** a opakování ji
 #: nespraví (`bmx/views/track_agent.py`). Do agenta 1.12 se trvalá chyba
@@ -607,6 +607,104 @@ def tcp_exchange(args: dict) -> dict:
                 raise
 
 
+#: Kolik času nejméně musí do začátku sekundy zbývat, aby se stihlo připravit
+#: spojení na dekodéry; jinak se čeká na další sekundu.
+REZERVA_PRED_SEKUNDOU_S = 0.15
+
+
+def _odesli_a_precti(sock: socket.socket, payload: bytes, timeout: float, quiet: float) -> bytes:
+    sock.sendall(payload)
+    deadline = time.monotonic() + timeout
+    chunks: list[bytes] = []
+    while time.monotonic() < deadline:
+        sock.settimeout(min(quiet, max(0.05, deadline - time.monotonic())))
+        try:
+            chunk = sock.recv(8192)
+        except socket.timeout:
+            if chunks:
+                break
+            continue
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def tcp_v_sekunde(args: dict) -> dict:
+    """Srovnání hodin dekodérů — **okamžik odeslání určuje krabička** (1.25).
+
+    Do verze 1.24 počítal čas server ve chvíli, kdy příkaz zařadil do fronty,
+    a dekodér ho dostal o cestu přes internet později — druhý dekodér ještě
+    o jeden příkaz později. Finish tak zůstal 1,2 s za Hill (16. 10. 2026),
+    a protože brána je jen v Hill, rozdíl šel do cílového času.
+
+    Server pošle pro každý dekodér hotové rámce na celé sekundy dopředu
+    (`ramce: {"<unix sekunda>": base64}`); agent protokolu dál nerozumí —
+    počká na začátek nejbližší sekundy, pro kterou rámec mají všichni,
+    a pošle ho **všem dekodérům naráz** (vlákno na dekodér). `posun_ms` je
+    oprava hodin krabičky proti serveru, když ji server naměřil.
+    """
+    timeout = float(args.get("timeout") or 2.0)
+    quiet = float(args.get("quiet") or 0.3)
+    posun_s = float(args.get("posun_ms") or 0) / 1000.0
+    cile = []
+    for cil in args.get("cile") or []:
+        host, port = _validated_target(cil["host"], int(cil["port"]))
+        ramce = {int(k): base64.b64decode(v) for k, v in (cil.get("ramce") or {}).items()}
+        cile.append((host, port, ramce))
+    if not cile:
+        raise ValueError("Žádný dekodér k nastavení.")
+    ted = time.time() + posun_s
+    spolecne = set.intersection(*(set(r) for _h, _p, r in cile))
+    kandidati = sorted(sek for sek in spolecne if sek - ted >= REZERVA_PRED_SEKUNDOU_S)
+    if not kandidati:
+        raise ValueError("Rámce jsou pro sekundy, které už uplynuly — hodiny krabičky a serveru se rozcházejí.")
+    sekunda = kandidati[0]
+
+    spojeni: dict = {}
+    vysledky: list = [{} for _ in cile]
+    for i, (host, port, _r) in enumerate(cile):
+        try:
+            sock = _connection(host, port, timeout)
+            _drain(sock)
+            spojeni[i] = sock
+        except OSError as exc:
+            _drop((host, port))
+            vysledky[i] = {"host": host, "port": port, "error": str(exc) or type(exc).__name__}
+
+    start = threading.Event()
+    odeslano: list = []
+
+    def posli(i: int) -> None:
+        host, port, ramce = cile[i]
+        start.wait()
+        try:
+            odeslano.append(time.time() + posun_s)
+            data = _odesli_a_precti(spojeni[i], ramce[sekunda], timeout, quiet)
+            vysledky[i] = {"host": host, "port": port, "data": base64.b64encode(data).decode("ascii")}
+        except OSError as exc:
+            _drop((host, port))
+            vysledky[i] = {"host": host, "port": port, "error": str(exc) or type(exc).__name__}
+
+    vlakna = [threading.Thread(target=posli, args=(i,), daemon=True) for i in spojeni]
+    for vlakno in vlakna:
+        vlakno.start()
+    while True:
+        zbyva = sekunda - (time.time() + posun_s)
+        if zbyva <= 0:
+            break
+        time.sleep(min(zbyva, 0.05) if zbyva > 0.002 else 0)
+    start.set()
+    for vlakno in vlakna:
+        vlakno.join(timeout + 1.0)
+    return {
+        "sekunda": sekunda,
+        "odeslano_unix_ms": round(min(odeslano) * 1000) if odeslano else None,
+        "rozptyl_ms": round((max(odeslano) - min(odeslano)) * 1000, 1) if len(odeslano) > 1 else 0.0,
+        "vysledky": vysledky,
+    }
+
+
 def broadcast_targets() -> list[str]:
     """Kam poslat broadcast — **na každé rozhraní, ne jen do výchozí trasy**.
 
@@ -831,6 +929,7 @@ ACTIONS = {
     "tcp_probe": tcp_probe,
     "tcp_send": tcp_send,
     "tcp_exchange": tcp_exchange,
+    "tcp_v_sekunde": tcp_v_sekunde,
     "udp_discover": udp_discover,
     "clock_info": clock_info,
     "network_info": network_info,
